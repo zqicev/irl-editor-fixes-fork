@@ -6,6 +6,8 @@
   "client": [
     "GameRendererLightMixin",
     "MinecraftClientImGuiMixin",
+    "MouseImGuiMixin",
+    "KeyboardImGuiMixin",
     "WorldBlockChangeMixin",
     "WorldBlockEntityTickersAccessor",
     "iris.ProgramSamplersBuilderMixin",

@@ -74,6 +74,12 @@ dependencies {
 	modRuntimeOnly "org.anarres:jcpp:1.4.14"
 	modRuntimeOnly "io.github.douira:glsl-transformer:3.0.0-pre3"
 	modRuntimeOnly "org.antlr:antlr4-runtime:4.13.1"
+
+	// --- TEST HARNESS ONLY (runClient) ---
+	// NOT a dependency of the mod itself — the Replay Mod integration is gated by
+	// FabricLoader.isModLoaded("replaymod") + reflection. This only puts Replay Mod
+	// on the dev classpath so the editor can be tested inside a replay.
+	modRuntimeOnly "maven.modrinth:replaymod:1.21.11-2.6.26"
 }
 
 processResources {

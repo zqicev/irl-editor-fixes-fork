@@ -36,6 +36,11 @@ public final class LightGuideRenderer
     private static final int CONE_SPOKES = 4;
     private static final float POINT_CROSS = 0.4f;
     private static final float MAX_CONE_LEN = 16f;
+    private static final float LINE_WIDTH = 2.0f;
+
+    /** Latched off after any render failure — a non-critical overlay must never
+     *  crash the game (and never spam the log frame after frame). */
+    private static boolean broken = false;
 
     private LightGuideRenderer()
     {}
@@ -49,11 +54,24 @@ public final class LightGuideRenderer
 
     private static void onRender(WorldRenderContext ctx)
     {
-        if (!LightConfig.showGuides || LightScene.count() == 0)
+        if (broken || !LightConfig.showGuides || LightScene.count() == 0)
         {
             return;
         }
 
+        try
+        {
+            renderGuides(ctx);
+        }
+        catch (Throwable t)
+        {
+            broken = true;
+            System.err.println("[irl-redactor] light guides disabled after render error: " + t);
+        }
+    }
+
+    private static void renderGuides(WorldRenderContext ctx)
+    {
         Camera cam = ctx.gameRenderer().getCamera();
         if (cam == null)
         {
@@ -168,8 +186,11 @@ public final class LightGuideRenderer
         {
             nx /= nl; ny /= nl; nz /= nl;
         }
-        buf.vertex(e.getPositionMatrix(), x1, y1, z1).color(r, g, b, 1f).normal(e, nx, ny, nz);
-        buf.vertex(e.getPositionMatrix(), x2, y2, z2).color(r, g, b, 1f).normal(e, nx, ny, nz);
+        // The lines layer uses POSITION_COLOR_NORMAL_LINE_WIDTH — the per-vertex
+        // LineWidth element is mandatory (omitting it throws "Missing elements in
+        // vertex: LineWidth"), so it must be written on every vertex.
+        buf.vertex(e.getPositionMatrix(), x1, y1, z1).color(r, g, b, 1f).normal(e, nx, ny, nz).lineWidth(LINE_WIDTH);
+        buf.vertex(e.getPositionMatrix(), x2, y2, z2).color(r, g, b, 1f).normal(e, nx, ny, nz).lineWidth(LINE_WIDTH);
     }
 
     /** Clamp to [0,1] with a floor so a very dark light still has a visible guide. */

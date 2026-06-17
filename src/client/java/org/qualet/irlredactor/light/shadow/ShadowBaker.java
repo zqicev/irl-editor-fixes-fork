@@ -153,6 +153,13 @@ public final class ShadowBaker
     private static final int[] pointSlotActive = new int[PointShadowArray.MAX_SHADOWS];
     /** Monotonic bake counter driving the staleness test (not wall time). */
     private static int frameIndex;
+    /** Remaining FULL STATIC bakes this frame (T2.4). Reset each frame from
+     *  {@link LightConfig#shadowBakeBudget()} ({@code <= 0} -> unlimited).
+     *  Deferrable static bakes run only while this is positive; mandatory ones
+     *  (first bake / tile reassigned, can't show a blank or foreign map) run
+     *  regardless and still consume a unit, so they don't starve later lamps of
+     *  a deferral. Dynamic overlays and static->live copies are NOT counted. */
+    private static int staticBakeBudget;
     /** Last seen shadow-quality setting; a change frees + re-allocates the
      *  depth textures, so every cached map must be forgotten with it. */
     private static int lastQuality = Integer.MIN_VALUE;
@@ -245,6 +252,9 @@ public final class ShadowBaker
         int n = LightRegistry.getCount();
         boolean cache = LightConfig.shadowCache();
         frameIndex++;
+        // Per-frame full-static-bake budget (T2.4). <= 0 means unlimited.
+        int budget = LightConfig.shadowBakeBudget();
+        staticBakeBudget = budget <= 0 ? Integer.MAX_VALUE : budget;
         ShadowRenderer.beginBake();
 
         // Behind-camera cull inputs: a light whose whole influence sphere is
@@ -360,22 +370,36 @@ public final class ShadowBaker
                     || lastTile.get(id) != myTile;          // assigned a different tile
                 if (dirty)
                 {
-                    if (PROFILE)
+                    // First bake / tile reassigned can't be deferred — the live
+                    // tile holds no map of our own to keep showing. A deferrable
+                    // re-bake runs only within this frame's budget (T2.4).
+                    boolean mustBake = !lastTile.containsKey(id) || lastTile.get(id) != myTile;
+                    if (allowStaticBake(mustBake))
                     {
-                        profSpotBakes++;
+                        if (PROFILE)
+                        {
+                            profSpotBakes++;
+                        }
+                        ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, false, true);
+                        if (staticInRangeScratch > 0)
+                        {
+                            renderInRangeCone(CASTERS_STATIC, tickDelta);
+                        }
+                        if (!blocks.isEmpty())
+                        {
+                            ShadowRenderer.renderBlocksDepth(id, blocks);
+                        }
+                        ShadowRenderer.endPass();
+                        rememberLive(id, sig, myTile, blocks, false);
                     }
-                    ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, false, true);
-                    if (staticInRangeScratch > 0)
-                    {
-                        renderInRangeCone(CASTERS_STATIC, tickDelta);
-                    }
-                    if (!blocks.isEmpty())
-                    {
-                        ShadowRenderer.renderBlocksDepth(id, blocks);
-                    }
-                    ShadowRenderer.endPass();
+                    // else deferred: keep our own (older) live map and leave the
+                    // dirty state untouched so this re-bake retries next frame —
+                    // the SSBO already points at myTile (set above).
                 }
-                rememberLive(id, sig, myTile, blocks, false);
+                else
+                {
+                    rememberLive(id, sig, myTile, blocks, false);
+                }
                 continue;
             }
 
@@ -390,7 +414,17 @@ public final class ShadowBaker
                     || lastStaticSig.get(id) != sig
                     || lastStaticBlocks.get(id) != blocks
                     || lastStaticTile.get(id) != myTile;
-                if (staticStale)
+                // A static re-bake is deferrable only while a dynamic subject is
+                // present (dyn) AND we still own a previously-baked static tile to
+                // fall back on: the copy below restores that older base under the
+                // live overlay until budget lets it re-bake (T2.4). The frame a
+                // subject LEAVES (dyn false) must bake — the transition's
+                // rememberLive() marks the light clean, so a deferred stale base
+                // would never be noticed by the pure-static path again.
+                boolean staticMustBake = !dyn
+                    || !lastStaticTile.containsKey(id)
+                    || lastStaticTile.get(id) != myTile;
+                if (staticStale && allowStaticBake(staticMustBake))
                 {
                     if (PROFILE)
                     {
@@ -526,25 +560,37 @@ public final class ShadowBaker
                     || lastTile.get(id) != myLayer;
                 if (dirty)
                 {
-                    if (PROFILE)
+                    // First bake / tile reassigned can't be deferred; a deferrable
+                    // re-bake runs only within this frame's budget (T2.4).
+                    boolean mustBake = !lastTile.containsKey(id) || lastTile.get(id) != myLayer;
+                    if (allowStaticBake(mustBake))
                     {
-                        profPointBakes++;
-                    }
-                    for (int face = 0; face < 6; face++)
-                    {
-                        ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, false, true);
-                        if (staticInRangeScratch > 0)
+                        if (PROFILE)
                         {
-                            renderInRangeFace(face, CASTERS_STATIC, tickDelta);
+                            profPointBakes++;
                         }
-                        if (!blocks.isEmpty())
+                        for (int face = 0; face < 6; face++)
                         {
-                            ShadowRenderer.renderBlocksDepth(id, blocks);
+                            ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, false, true);
+                            if (staticInRangeScratch > 0)
+                            {
+                                renderInRangeFace(face, CASTERS_STATIC, tickDelta);
+                            }
+                            if (!blocks.isEmpty())
+                            {
+                                ShadowRenderer.renderBlocksDepth(id, blocks);
+                            }
+                            ShadowRenderer.endPass();
                         }
-                        ShadowRenderer.endPass();
+                        rememberLive(id, sig, myLayer, blocks, false);
                     }
+                    // else deferred: keep our own (older) live cube; dirty state
+                    // unchanged so the re-bake retries next frame (SSBO -> myLayer).
                 }
-                rememberLive(id, sig, myLayer, blocks, false);
+                else
+                {
+                    rememberLive(id, sig, myLayer, blocks, false);
+                }
                 continue;
             }
 
@@ -558,8 +604,15 @@ public final class ShadowBaker
                     || lastStaticSig.get(id) != sig
                     || lastStaticBlocks.get(id) != blocks
                     || lastStaticTile.get(id) != myLayer;
-                if (staticStale)
+                // Deferrable only while a dynamic subject is present and we own a
+                // prior static cube to fall back on (see the spot overlay note).
+                boolean staticMustBake = !dyn
+                    || !lastStaticTile.containsKey(id)
+                    || lastStaticTile.get(id) != myLayer;
+                boolean bakedStatic = false;
+                if (staticStale && allowStaticBake(staticMustBake))
                 {
+                    bakedStatic = true;
                     if (PROFILE)
                     {
                         profPointBakes++;
@@ -583,16 +636,18 @@ public final class ShadowBaker
                 }
 
                 // Restore the static base into the live cube (T1.2). When the
-                // static layer was just re-baked (staticStale) every live face
+                // static layer was just re-baked (bakedStatic) every live face
                 // needs the new base, so blit all 6 in one call — this also
-                // covers first-overlay and post-tile-steal (both force
-                // staticStale via an absent / purged lastStaticTile). Otherwise
-                // copy only the faces that need it: the ones a dynamic caster
-                // touches now (dynNow) OR touched last frame (lastFaceDynamic, so
-                // a vacated face restores to static instead of keeping its stale
-                // silhouette). Untouched faces already hold the static base.
+                // covers first-overlay and post-tile-steal (both force a bake via
+                // an absent / purged lastStaticTile). Otherwise copy only the
+                // faces that need it: the ones a dynamic caster touches now
+                // (dynNow) OR touched last frame (lastFaceDynamic, so a vacated
+                // face restores to static instead of keeping its stale
+                // silhouette). Untouched faces already hold the static base —
+                // including when a stale re-bake was DEFERRED (T2.4): the static
+                // cube is unchanged, so the live cube's static faces still match.
                 int dynNow = dynFaceMaskScratch;
-                if (staticStale)
+                if (bakedStatic)
                 {
                     PointShadowArray.copyStaticToLive(myLayer);
                 }
@@ -738,6 +793,25 @@ public final class ShadowBaker
         owner[take] = id;
         active[take] = frameIndex;
         return take;
+    }
+
+    /** Budget gate for one FULL STATIC bake (T2.4). {@code mustBake} bakes
+     *  (first bake / tile reassigned — no own map to fall back on; or a subject
+     *  leaving, where the staleness bookkeeping can't carry over) always
+     *  proceed; otherwise the bake runs only while this frame's budget remains.
+     *  A bake that runs consumes one unit either way (mandatory bakes may push
+     *  the budget below zero, which simply defers the frame's remaining
+     *  deferrable bakes). Returns true to bake now, false to defer — the caller
+     *  then keeps the existing map and leaves its dirty state untouched, so the
+     *  same re-bake is retried next frame. */
+    private static boolean allowStaticBake(boolean mustBake)
+    {
+        if (mustBake || staticBakeBudget > 0)
+        {
+            staticBakeBudget--;
+            return true;
+        }
+        return false;
     }
 
     /** Drop one light's dirty state so its next bake is a clean first bake

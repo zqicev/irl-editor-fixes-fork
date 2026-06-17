@@ -18,6 +18,15 @@ public final class LightConfig
     public static boolean shadowBlocks = true;
     /** Block-shadow collection radius in blocks (default 24). */
     public static int shadowBlockRadius = 24;
+    /** Max full static shadow bakes started per frame before the rest are
+     *  deferred to a later frame (default 4). Spreads a mass invalidation (a
+     *  block edit near a cluster of lamps) across frames instead of one spike;
+     *  the deferred lamps keep their existing (slightly stale) map until baked.
+     *  &lt;= 0 disables throttling (bake everything every frame). First bakes and
+     *  tile-reassign bakes are never deferred (they would sample a blank or
+     *  foreign map); dynamic overlays and static-&gt;live copies are never
+     *  budgeted (they must run every frame). */
+    public static int shadowBakeBudget = 4;
 
     private LightConfig()
     {}
@@ -45,5 +54,10 @@ public final class LightConfig
     public static int shadowBlockRadius()
     {
         return shadowBlockRadius;
+    }
+
+    public static int shadowBakeBudget()
+    {
+        return shadowBakeBudget;
     }
 }

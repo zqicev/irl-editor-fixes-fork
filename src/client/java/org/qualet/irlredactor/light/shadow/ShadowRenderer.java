@@ -15,7 +15,6 @@ import net.minecraft.client.render.LightmapTextureManager;
 import net.minecraft.client.render.RenderLayer;
 import net.minecraft.client.render.RenderLayers;
 import net.minecraft.client.render.Tessellator;
-import net.minecraft.client.render.VertexConsumer;
 import net.minecraft.client.render.VertexConsumerProvider;
 import net.minecraft.client.render.VertexFormat;
 import net.minecraft.client.render.VertexFormats;
@@ -265,6 +264,32 @@ public final class ShadowRenderer
     private static final Long2ObjectOpenHashMap<VertexBuffer> blockVboById = new Long2ObjectOpenHashMap<>();
     private static final Long2ObjectOpenHashMap<List<BlockShadowEntry>> blockVboListById = new Long2ObjectOpenHashMap<>();
 
+    // --- Per-light cutout block VBO cache (T2.3), keyed by LightRegistry.id ---
+    // Cutout blocks (doors, leaves, glass panes, iron bars) were re-tessellated
+    // through brm.renderBlock on every static bake — and once PER CUBE FACE for
+    // point lights, so a point lamp paid 6x that CPU cost each bake. Capture them
+    // once into a textured VBO per render layer (CUTOUT / CUTOUT_MIPPED), keyed
+    // by id + the referentially-stable block-list instance, then redraw the VBO
+    // under that layer's own cutout shader + block atlas (alpha-discard intact)
+    // for every face / tile. Rebuilt only when the list instance changes; evicted
+    // alongside the opaque VBOs in retainBlockVbos. NOTE: the captured atlas UVs
+    // would go stale on a resource-pack reload that repacks the atlas without any
+    // block change — rare, out of the perf scope, and recovered by any later edit.
+    private static final class CutoutVbos
+    {
+        VertexBuffer cutout;        // blocks on RenderLayer.getCutout()
+        VertexBuffer cutoutMipped;  // blocks on RenderLayer.getCutoutMipped()
+
+        void close()
+        {
+            if (cutout != null) { try { cutout.close(); } catch (Throwable ignored) {} cutout = null; }
+            if (cutoutMipped != null) { try { cutoutMipped.close(); } catch (Throwable ignored) {} cutoutMipped = null; }
+        }
+    }
+
+    private static final Long2ObjectOpenHashMap<CutoutVbos> cutoutVboById = new Long2ObjectOpenHashMap<>();
+    private static final Long2ObjectOpenHashMap<List<BlockShadowEntry>> cutoutVboListById = new Long2ObjectOpenHashMap<>();
+
     /**
      * Render a light's non-full-cube blocks into the currently-bound depth FBO,
      * between a begin*()/endPass() bracket and after the entity casters. Two
@@ -280,7 +305,7 @@ public final class ShadowRenderer
         }
 
         // Cutout blocks first (their own textured pass), then opaque AABBs.
-        renderBlocksDepthCutout(blocks);
+        renderBlocksDepthCutout(id, blocks);
 
         boolean anyShape = false;
         for (int i = 0, n = blocks.size(); i < n; i++)
@@ -405,34 +430,56 @@ public final class ShadowRenderer
      *  -> empty set drains all). Run once per bake after the light loops. */
     public static void retainBlockVbos(LongSet liveIds)
     {
-        if (blockVboById.isEmpty())
+        if (!blockVboById.isEmpty())
         {
-            return;
-        }
-        ObjectIterator<Long2ObjectMap.Entry<VertexBuffer>> it = blockVboById.long2ObjectEntrySet().iterator();
-        while (it.hasNext())
-        {
-            Long2ObjectMap.Entry<VertexBuffer> me = it.next();
-            if (!liveIds.contains(me.getLongKey()))
+            ObjectIterator<Long2ObjectMap.Entry<VertexBuffer>> it = blockVboById.long2ObjectEntrySet().iterator();
+            while (it.hasNext())
             {
-                VertexBuffer vb = me.getValue();
-                if (vb != null)
+                Long2ObjectMap.Entry<VertexBuffer> me = it.next();
+                if (!liveIds.contains(me.getLongKey()))
                 {
-                    try { vb.close(); } catch (Throwable ignored) {}
+                    VertexBuffer vb = me.getValue();
+                    if (vb != null)
+                    {
+                        try { vb.close(); } catch (Throwable ignored) {}
+                    }
+                    blockVboListById.remove(me.getLongKey());
+                    it.remove();
                 }
-                blockVboListById.remove(me.getLongKey());
-                it.remove();
+            }
+        }
+
+        // Same eviction for the cutout VBOs (a lamp with only cutout blocks has
+        // no opaque VBO, so this can't be folded into the loop above).
+        if (!cutoutVboById.isEmpty())
+        {
+            ObjectIterator<Long2ObjectMap.Entry<CutoutVbos>> it = cutoutVboById.long2ObjectEntrySet().iterator();
+            while (it.hasNext())
+            {
+                Long2ObjectMap.Entry<CutoutVbos> me = it.next();
+                if (!liveIds.contains(me.getLongKey()))
+                {
+                    CutoutVbos v = me.getValue();
+                    if (v != null)
+                    {
+                        v.close();
+                    }
+                    cutoutVboListById.remove(me.getLongKey());
+                    it.remove();
+                }
             }
         }
     }
 
     // Cutout blocks bake from their textured BakedModel through vanilla's
     // alpha-test cutout shader so transparent texture pixels (door glass, iron
-    // grates, ladder gaps, leaves) let light pass through. immediate.draw binds
-    // the block atlas to Sampler0 and sets the cutout(_mipped) shader whose FS
-    // does the alpha discard; colour writes land on no attachment in our
-    // depth-only FBO, so only depth is recorded.
-    private static void renderBlocksDepthCutout(List<BlockShadowEntry> blocks)
+    // grates, ladder gaps, leaves) let light pass through. The tessellated
+    // geometry is cached per light in a VBO per render layer (T2.3) and redrawn
+    // each face / tile under that layer's cutout shader: startDrawing binds the
+    // block atlas to Sampler0 and sets the cutout(_mipped) shader whose FS does
+    // the alpha discard; colour writes land on no attachment in our depth-only
+    // FBO, so only depth is recorded.
+    private static void renderBlocksDepthCutout(long id, List<BlockShadowEntry> blocks)
     {
         MinecraftClient mc = MinecraftClient.getInstance();
         ClientWorld world = mc.world;
@@ -462,105 +509,172 @@ public final class ShadowRenderer
             return;
         }
 
-        VertexConsumerProvider.Immediate immediate = mc.getBufferBuilders().getEntityVertexConsumers();
+        // Tessellate once per (id, list instance); reuse across all 6 cube faces
+        // / the single atlas tile and across static bakes while the list is
+        // stable (BlockShadowCache returns the same instance until a block in
+        // range changes), so a static lamp re-tessellates nothing.
+        CutoutVbos vbos = cutoutVboById.get(id);
+        if (vbos == null || cutoutVboListById.get(id) != blocks)
+        {
+            if (vbos != null)
+            {
+                vbos.close();
+            }
+            ShadowBakeState.setBaking(true);
+            try
+            {
+                vbos = buildCutoutVbos(blocks, world, brm);
+            }
+            catch (Throwable t)
+            {
+                if (!blockRenderErrorLogged)
+                {
+                    blockRenderErrorLogged = true;
+                    System.err.println("[irlite] buildCutoutVbos failed: " + t);
+                    t.printStackTrace();
+                }
+                releaseCutoutVbos(id);
+                return;
+            }
+            finally
+            {
+                ShadowBakeState.setBaking(false);
+            }
+            cutoutVboById.put(id, vbos);
+            cutoutVboListById.put(id, blocks);
+        }
 
-        ShadowBakeState.setBaking(true);
-        MatrixStack mv = RenderSystem.getModelViewStack();
-        boolean mvPushed = false;
+        // Redraw the cached VBOs. vb.draw is handed the LIGHT's own view/proj
+        // explicitly, so — unlike the old immediate.draw path — it never reads
+        // RenderSystem's live modelview, which a vanilla-mob caster baked earlier
+        // in this pass can leave corrupted (that was the original "a second cutout
+        // layer makes the others' shadows vanish" bug; gone here by construction).
         try
         {
-            RenderSystem.depthMask(true);
-            RenderSystem.enableDepthTest();
-            RenderSystem.disableBlend();
-
-            // Establish the LIGHT's own view/proj BEFORE the collection loop, not
-            // just before the final immediate.draw(). Cutout blocks of different
-            // RenderLayers (a door/trapdoor on CUTOUT; leaves/glass/bars on
-            // CUTOUT_MIPPED) all share the Immediate's fallback BufferBuilder, so
-            // requesting a buffer for a NEW layer auto-flushes the PREVIOUS layer
-            // mid-loop. That flush reads RenderSystem's live matrices — which a
-            // vanilla-mob caster baked earlier in this pass leaves corrupted — so
-            // with the matrices fixed only after the loop, every cutout layer but
-            // the last drew into nowhere and its shadows vanished the moment a
-            // second cutout layer was present (one layer alone always worked, hence
-            // "remove the trapdoor and the leaf/glass shadows come back"). Setting
-            // them first makes both the mid-loop auto-flushes and the final draw
-            // land in the depth map. mvPushed + the finally keep the stack balanced.
-            mv.push();
-            mvPushed = true;
-            mv.loadIdentity();
-            mv.multiplyPositionMatrix(currentView);
-            RenderSystem.applyModelViewMatrix();
-            RenderSystem.setProjectionMatrix(currentProj, VertexSorter.BY_DISTANCE);
-
-            resetScratch();
-            MatrixStack stack = scratch;
-            for (int i = 0, n = blocks.size(); i < n; i++)
-            {
-                BlockShadowEntry entry = blocks.get(i);
-                if (entry == null || !entry.cutout)
-                {
-                    continue;
-                }
-                BlockPos p = entry.pos;
-                BlockState state = world.getBlockState(p);
-                if (state.isAir())
-                {
-                    continue;
-                }
-
-                RenderLayer layer;
-                try
-                {
-                    layer = RenderLayers.getBlockLayer(state);
-                }
-                catch (Throwable t)
-                {
-                    continue;
-                }
-                if (layer != RenderLayer.getCutout() && layer != RenderLayer.getCutoutMipped())
-                {
-                    continue;
-                }
-
-                VertexConsumer consumer = immediate.getBuffer(layer);
-                stack.push();
-                stack.translate(p.getX(), p.getY(), p.getZ());
-                cutoutRandom.setSeed(state.getRenderingSeed(p));
-                try
-                {
-                    brm.renderBlock(state, p, world, stack, consumer, true, cutoutRandom);
-                }
-                catch (Throwable t)
-                {
-                    // skip a single broken block, keep baking the rest
-                }
-                stack.pop();
-            }
-            // Flush the final layer. The mid-loop auto-flushes (on each layer
-            // switch, see the note above) and this one all run with the light's
-            // matrices that were set before the loop, so every cutout layer lands
-            // in the depth map regardless of what a caster left on RenderSystem.
-            immediate.draw();
+            drawCutoutVbo(RenderLayer.getCutout(), vbos.cutout);
+            drawCutoutVbo(RenderLayer.getCutoutMipped(), vbos.cutoutMipped);
         }
         catch (Throwable t)
         {
             if (!blockRenderErrorLogged)
             {
                 blockRenderErrorLogged = true;
-                System.err.println("[irlite] renderBlocksDepthCutout failed: " + t);
+                System.err.println("[irlite] drawCutoutVbo failed: " + t);
                 t.printStackTrace();
             }
         }
+    }
+
+    /** Tessellate a light's cutout blocks into one STATIC textured VBO per
+     *  cutout render layer (CUTOUT / CUTOUT_MIPPED). */
+    private static CutoutVbos buildCutoutVbos(List<BlockShadowEntry> blocks, ClientWorld world, BlockRenderManager brm)
+    {
+        CutoutVbos out = new CutoutVbos();
+        out.cutout = buildCutoutLayerVbo(blocks, world, brm, RenderLayer.getCutout());
+        out.cutoutMipped = buildCutoutLayerVbo(blocks, world, brm, RenderLayer.getCutoutMipped());
+        return out;
+    }
+
+    /** Tessellate the cutout blocks that map to ONE render layer into a STATIC
+     *  VBO in that layer's textured vertex format, exactly as the old immediate
+     *  path did (cull on, per-block render seed). Returns null if no block maps
+     *  to this layer or they all tessellate to nothing (e.g. fully neighbour-
+     *  culled), so the redraw skips a missing layer. */
+    private static VertexBuffer buildCutoutLayerVbo(List<BlockShadowEntry> blocks, ClientWorld world, BlockRenderManager brm, RenderLayer layer)
+    {
+        Tessellator tess = Tessellator.getInstance();
+        BufferBuilder buf = tess.getBuffer();
+        buf.begin(layer.getDrawMode(), layer.getVertexFormat());
+
+        resetScratch();
+        MatrixStack stack = scratch;
+        for (int i = 0, n = blocks.size(); i < n; i++)
+        {
+            BlockShadowEntry entry = blocks.get(i);
+            if (entry == null || !entry.cutout)
+            {
+                continue;
+            }
+            BlockPos p = entry.pos;
+            BlockState state = world.getBlockState(p);
+            if (state.isAir())
+            {
+                continue;
+            }
+
+            RenderLayer bl;
+            try
+            {
+                bl = RenderLayers.getBlockLayer(state);
+            }
+            catch (Throwable t)
+            {
+                continue;
+            }
+            if (bl != layer)
+            {
+                continue;
+            }
+
+            stack.push();
+            stack.translate(p.getX(), p.getY(), p.getZ());
+            cutoutRandom.setSeed(state.getRenderingSeed(p));
+            try
+            {
+                brm.renderBlock(state, p, world, stack, buf, true, cutoutRandom);
+            }
+            catch (Throwable t)
+            {
+                // skip a single broken block, keep tessellating the rest
+            }
+            stack.pop();
+        }
+
+        BufferBuilder.BuiltBuffer built = buf.endNullable();
+        if (built == null)
+        {
+            return null; // nothing emitted for this layer
+        }
+        VertexBuffer vb = new VertexBuffer(VertexBuffer.Usage.STATIC);
+        vb.bind();
+        vb.upload(built);
+        VertexBuffer.unbind();
+        return vb;
+    }
+
+    /** Draw one cached cutout layer VBO under that layer's render state.
+     *  startDrawing/endDrawing replicate exactly what immediate.draw uses for
+     *  the layer — cutout shader, block atlas on Sampler0, blend off, cull on —
+     *  so transparent texels still discard; only the light's own view/proj reach
+     *  the shader (corruption-proof). The depth-only FBO drops the colour writes. */
+    private static void drawCutoutVbo(RenderLayer layer, VertexBuffer vb)
+    {
+        if (vb == null)
+        {
+            return;
+        }
+        layer.startDrawing();
+        try
+        {
+            vb.bind();
+            vb.draw(currentView, currentProj, RenderSystem.getShader());
+            VertexBuffer.unbind();
+        }
         finally
         {
-            if (mvPushed)
-            {
-                mv.pop();
-                RenderSystem.applyModelViewMatrix();
-            }
-            ShadowBakeState.setBaking(false);
+            layer.endDrawing();
         }
+    }
+
+    /** Free one lamp's cached cutout VBOs. */
+    private static void releaseCutoutVbos(long id)
+    {
+        CutoutVbos v = cutoutVboById.remove(id);
+        if (v != null)
+        {
+            v.close();
+        }
+        cutoutVboListById.remove(id);
     }
 
     /**

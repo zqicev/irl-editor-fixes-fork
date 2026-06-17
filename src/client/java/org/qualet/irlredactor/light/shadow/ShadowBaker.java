@@ -6,9 +6,6 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import net.minecraft.client.world.ClientWorld;
-import net.minecraft.entity.Entity;
-import net.minecraft.entity.ItemEntity;
-import net.minecraft.entity.LivingEntity;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -44,12 +41,13 @@ import java.util.Locale;
 public final class ShadowBaker
 {
     private static final int MAX_OCCLUDERS = 32;
-    private static final double COLLECT_DIST = 72.0;
-    private static final double COLLECT_DIST_SQ = COLLECT_DIST * COLLECT_DIST;
     private static final float OVERLAP_MARGIN = 0.5f;
 
     private static final long FNV_OFFSET = 1469598103934665603L;
     private static final long FNV_PRIME = 1099511628211L;
+    /** Odd multiplier folding the in-range static COUNT into a light's signature
+     *  (seam INVARIANT 3); count 0 (every redactor light) leaves the sig untouched. */
+    private static final long STATIC_COUNT_MIX = 0x9E3779B97F4A7C15L;
 
     private static final Object[] occ = new Object[MAX_OCCLUDERS];
     private static final int[] occType = new int[MAX_OCCLUDERS];
@@ -57,6 +55,11 @@ public final class ShadowBaker
     private static final float[] oy = new float[MAX_OCCLUDERS];
     private static final float[] oz = new float[MAX_OCCLUDERS];
     private static final float[] orad = new float[MAX_OCCLUDERS];
+    /** Static-layer membership, INDEPENDENT of {@link #occType} (seam INVARIANT 2).
+     *  True => baked into the never-rebaked static base; its silhouette changes only
+     *  when {@link #ostatichash} changes. False (every redactor caster — all dynamic
+     *  entities) => re-rendered every frame. */
+    private static final boolean[] oStatic = new boolean[MAX_OCCLUDERS];
     /** Per-occluder signature of everything that changes a STATIC (model-block)
      *  caster's baked silhouette but isn't its center: form identity + transform
      *  translate/scale/rotate. Folded into a light's signature for model blocks
@@ -334,6 +337,7 @@ public final class ShadowBaker
                 continue; // every tile owned by a recently-active light -> unshadowed
             }
             long sig = lightGeomSig(lx, ly, lz, dx, dy, dz, range, cosOuter, castsShadows) + staticOccSigScratch;
+            sig ^= staticInRangeScratch * STATIC_COUNT_MIX; // fold static count (INVARIANT 3); 0 on redactor
             boolean dyn = dynamicInRangeScratch;
             boolean hasStatic = staticInRangeScratch > 0 || !blocks.isEmpty();
             float outerDeg = (float) Math.toDegrees(coneTheta * 2.0);
@@ -523,6 +527,7 @@ public final class ShadowBaker
                 continue; // every slot owned by a recently-active light -> unshadowed
             }
             long sig = lightGeomSig(lx, ly, lz, 0f, 0f, 0f, radius, 1f, castsShadows) + staticOccSigScratch;
+            sig ^= staticInRangeScratch * STATIC_COUNT_MIX; // fold static count (INVARIANT 3); 0 on redactor
             boolean dyn = dynamicInRangeScratch;
             boolean hasStatic = staticInRangeScratch > 0 || !blocks.isEmpty();
             LightRegistry.setShadowTile(i, myLayer);
@@ -974,6 +979,16 @@ public final class ShadowBaker
         return (h ^ (Float.floatToRawIntBits(v) & 0xffffffffL)) * FNV_PRIME;
     }
 
+    /** SplitMix64 finalizer — a full-avalanche scramble of one 64-bit value, used to
+     *  fold per-occluder static hashes order-independently without the additive
+     *  cancellation a plain sum allows (seam INVARIANT 3). */
+    private static long mix64(long z)
+    {
+        z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
+        z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
+        return z ^ (z >>> 31);
+    }
+
     /** Signature of a light's own bake-relevant geometry: position, direction,
      *  range, spot cone (cosOuter), and the shadows flag. Any change re-bakes. */
     private static long lightGeomSig(float lx, float ly, float lz, float dx, float dy, float dz, float range, float cosOuter, boolean shadows)
@@ -1035,9 +1050,13 @@ public final class ShadowBaker
             shortIdx[sc] = k;
             shortFaceMask[sc] = faceMask;
             sc++;
-            if (occType[k] == ShadowRenderer.CASTER_MODEL_BLOCK)
+            if (oStatic[k])
             {
-                sig += ostatichash[k];
+                // INVARIANT 3: avalanche-mix each static hash before folding (a plain
+                // additive sum is non-injective — compensating paired edits cancel).
+                // Order-independent (commutative XOR of mixed values). Inert on
+                // redactor (no static casters); live for IRLite model blocks.
+                sig ^= mix64(ostatichash[k]);
                 statics++;
             }
             else
@@ -1061,15 +1080,15 @@ public final class ShadowBaker
     private static final int CASTERS_STATIC = 1;
     private static final int CASTERS_DYNAMIC = 2;
 
-    private static boolean casterMatches(int filter, int type)
+    private static boolean casterMatches(int filter, boolean isStatic)
     {
         if (filter == CASTERS_STATIC)
         {
-            return type == ShadowRenderer.CASTER_MODEL_BLOCK;
+            return isStatic;
         }
         if (filter == CASTERS_DYNAMIC)
         {
-            return type != ShadowRenderer.CASTER_MODEL_BLOCK;
+            return !isStatic;
         }
         return true;
     }
@@ -1086,11 +1105,11 @@ public final class ShadowBaker
         for (int s = 0; s < shortCount; s++)
         {
             int k = shortIdx[s];
-            if (!casterMatches(filter, occType[k]))
+            if (!casterMatches(filter, oStatic[k]))
             {
                 continue;
             }
-            ShadowRenderer.bufferCaster(occ[k], occType[k], tickDelta);
+            ShadowRenderer.emitCaster(SOURCE, occ[k], occType[k], tickDelta);
         }
         ShadowRenderer.endCasterBatch();
     }
@@ -1111,11 +1130,11 @@ public final class ShadowBaker
                 continue;
             }
             int k = shortIdx[s];
-            if (!casterMatches(filter, occType[k]))
+            if (!casterMatches(filter, oStatic[k]))
             {
                 continue;
             }
-            ShadowRenderer.bufferCaster(occ[k], occType[k], tickDelta);
+            ShadowRenderer.emitCaster(SOURCE, occ[k], occType[k], tickDelta);
         }
         ShadowRenderer.endCasterBatch();
     }
@@ -1169,45 +1188,64 @@ public final class ShadowBaker
         return lim >= a && lim >= b;
     }
 
-    private static void collect(ClientWorld world, Vec3d cameraPos, float tickDelta)
-    {
-        occCount = 0;
-        double camX = cameraPos.x, camY = cameraPos.y, camZ = cameraPos.z;
+    /** The variant-specific caster source behind the seam (redactor: BBS-free,
+     *  vanilla entities). {@link #collect} routes through it; the orchestration
+     *  otherwise touches casters only as the faceless SoA + the two seam methods
+     *  ({@code collect} / {@code emitOccluder}). */
+    private static final ShadowCasterSource SOURCE = new RedactorEntityCasterSource();
 
-        // --- world entities (vanilla render path) ---
-        for (Entity entity : world.getEntities())
+    /** Allocation-free SoA writer the source fills (one slot per emit, dropped over
+     *  {@link #MAX_OCCLUDERS}). {@code emitFromBox} computes the cull-pinned bounding
+     *  sphere (mid-height center + circumscribing box-diagonal radius, INVARIANT 5)
+     *  so no source can supply a foreign sphere. */
+    private static final OccluderSink SINK = new OccluderSink()
+    {
+        @Override
+        public void emitFromBox(Object caster, int type, boolean isStatic,
+                                double interpX, double interpY, double interpZ,
+                                Box box, float scale, long staticHash)
         {
             if (occCount >= MAX_OCCLUDERS)
             {
-                break;
+                return;
             }
-            if (!(entity instanceof LivingEntity) && !(entity instanceof ItemEntity))
-            {
-                continue;
-            }
-
-            double ex = MathHelper.lerp(tickDelta, entity.lastRenderX, entity.getX());
-            double ey = MathHelper.lerp(tickDelta, entity.lastRenderY, entity.getY());
-            double ez = MathHelper.lerp(tickDelta, entity.lastRenderZ, entity.getZ());
-            double dx = ex - camX, dy = ey - camY, dz = ez - camZ;
-            if (dx * dx + dy * dy + dz * dz > COLLECT_DIST_SQ)
-            {
-                continue;
-            }
-
-            Box box = entity.getBoundingBox();
             // Box edge lengths via stable public fields (yarn renamed getXLength()
             // -> getLengthX() after 1.20.1; fields are identical across versions).
-            float rad = (float) (Math.max(box.maxX - box.minX, Math.max(box.maxY - box.minY, box.maxZ - box.minZ)) * 0.5) + OVERLAP_MARGIN;
-
-            occ[occCount] = entity;
-            occType[occCount] = ShadowRenderer.CASTER_ENTITY;
-            ox[occCount] = (float) ex;
-            oy[occCount] = (float) (ey + (box.maxY - box.minY) * 0.5);
-            oz[occCount] = (float) ez;
-            orad[occCount] = rad;
-            ostatichash[occCount] = 0L; // dynamic caster -> not part of any static signature
-            occCount++;
+            double ex = box.maxX - box.minX, ey = box.maxY - box.minY, ez = box.maxZ - box.minZ;
+            float rad = (float) (0.5 * Math.sqrt(ex * ex + ey * ey + ez * ez) * scale) + OVERLAP_MARGIN;
+            put(caster, type, isStatic, (float) interpX, (float) (interpY + ey * 0.5), (float) interpZ, rad, staticHash);
         }
+
+        @Override
+        public void emit(Object caster, int type, boolean isStatic,
+                         float cx, float cy, float cz, float radius, long staticHash)
+        {
+            if (occCount >= MAX_OCCLUDERS)
+            {
+                return;
+            }
+            put(caster, type, isStatic, cx, cy, cz, radius, staticHash);
+        }
+    };
+
+    /** Append one occluder into the fixed-32 SoA. */
+    private static void put(Object caster, int type, boolean isStatic,
+                            float cx, float cy, float cz, float radius, long staticHash)
+    {
+        occ[occCount] = caster;
+        occType[occCount] = type;
+        oStatic[occCount] = isStatic;
+        ox[occCount] = cx;
+        oy[occCount] = cy;
+        oz[occCount] = cz;
+        orad[occCount] = radius;
+        ostatichash[occCount] = staticHash;
+        occCount++;
+    }
+
+    private static void collect(ClientWorld world, Vec3d cameraPos, float tickDelta)
+    {
+        occCount = 0;
+        SOURCE.collect(world, cameraPos, tickDelta, SINK);
     }
 }

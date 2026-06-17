@@ -11,7 +11,6 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.VertexBuffer;
 import net.minecraft.client.render.BufferBuilder;
 import net.minecraft.client.render.GameRenderer;
-import net.minecraft.client.render.LightmapTextureManager;
 import net.minecraft.client.render.RenderLayer;
 import net.minecraft.client.render.RenderLayers;
 import net.minecraft.client.render.Tessellator;
@@ -19,12 +18,9 @@ import net.minecraft.client.render.VertexConsumerProvider;
 import net.minecraft.client.render.VertexFormat;
 import net.minecraft.client.render.VertexFormats;
 import net.minecraft.client.render.block.BlockRenderManager;
-import net.minecraft.client.render.entity.EntityRenderDispatcher;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.client.world.ClientWorld;
-import net.minecraft.entity.Entity;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.random.Random;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
@@ -43,7 +39,6 @@ import java.util.List;
 public final class ShadowRenderer
 {
     private static final float NEAR = 0.05f;
-    private static final int FULL_LIGHT = LightmapTextureManager.pack(15, 15);
 
     // Constant "up" axes for the spot lookAt — lookAt only reads them, so a
     // shared instance replaces the per-call allocation (T1.3).
@@ -88,6 +83,10 @@ public final class ShadowRenderer
      *  single-threaded). {@link #resetScratch} drains + identity-resets it
      *  before each use, so a caster that throws mid-build can't leave it dirty. */
     private static final MatrixStack scratch = new MatrixStack();
+
+    /** Reused Immediate-backed batch handed to {@link ShadowCasterSource#emitOccluder}
+     *  (the render thread is single-threaded, so one instance is safe). */
+    private static final ImmediateOccluderBatch casterBatch = new ImmediateOccluderBatch();
 
     private ShadowRenderer()
     {}
@@ -198,15 +197,11 @@ public final class ShadowRenderer
         applyMatrices(pointProj);
     }
 
-    public static final int CASTER_ENTITY = 0;
-    public static final int CASTER_MODEL_BLOCK = 1;
-    public static final int CASTER_REPLAY = 2;
-
     // --- Batched caster pass (T2.2) ------------------------------------------
     // Casters used to flush one immediate.draw() EACH (the old renderCaster), so a
     // point light with N subjects paid up to 6N GPU flushes — once per caster per
     // cube face. Now a pass brackets its casters with
-    //   beginCasterBatch() -> bufferCaster()* -> endCasterBatch()
+    //   beginCasterBatch() -> emitCaster()* -> endCasterBatch()
     // and flushes ONCE: the casters accumulate in the shared entity Immediate and
     // a single draw at the end submits them all, so a pass costs at most one flush
     // (one per face / per atlas tile) regardless of how many subjects it has.
@@ -215,7 +210,7 @@ public final class ShadowRenderer
      *  batch (each layer's RenderLayer.startDrawing sets the real state at flush
      *  time, but pin defensively, as the old per-caster path did) and enters
      *  baking mode so light-form renderers skip re-registration during the bake.
-     *  Casters are buffered with {@link #bufferCaster} and flushed by
+     *  Casters are emitted with {@link #emitCaster} and flushed by
      *  {@link #endCasterBatch}. No-op outside a begin*()/endPass() bracket. */
     public static void beginCasterBatch()
     {
@@ -229,12 +224,14 @@ public final class ShadowRenderer
         ShadowBakeState.setBaking(true);
     }
 
-    /** Buffer one caster into the shared entity Immediate WITHOUT flushing. A
-     *  caster that throws mid-build is isolated: whatever is buffered so far is
-     *  flushed immediately, terminating the broken buffer so its partial vertices
-     *  can never fuse with the next caster's into a garbage quad — the per-caster
-     *  isolation the old one-draw-per-caster path had for free. */
-    public static void bufferCaster(Object caster, int casterType, float tickDelta)
+    /** Shared per-caster wrapper around {@link ShadowCasterSource#emitOccluder}.
+     *  Owns the scratch reset and the per-caster exception + run isolation
+     *  (INVARIANT 4): the source emits one caster's depth geometry into the shared
+     *  Immediate (via {@link ImmediateOccluderBatch}); if it throws mid-build the
+     *  batch is drained here — re-asserting the light matrices (INVARIANT 1) — so
+     *  the broken caster's partial vertices can never fuse with the next caster's
+     *  into a garbage quad. The source NEVER flushes or catches its own throw. */
+    public static void emitCaster(ShadowCasterSource source, Object caster, int casterType, float tickDelta)
     {
         if (caster == null || !inPass)
         {
@@ -243,19 +240,18 @@ public final class ShadowRenderer
 
         VertexConsumerProvider.Immediate immediate = MinecraftClient.getInstance().getBufferBuilders().getEntityVertexConsumers();
         resetScratch();
+        casterBatch.bind(immediate, scratch);
+        casterBatch.mark();
         try
         {
-            // BBS-free engine: only vanilla world entities cast shadows. Model-block
-            // and film-replay casters were a BBS-form feature and are gone.
-            drawEntity((Entity) caster, scratch, immediate, tickDelta);
+            source.emitOccluder(caster, casterType, tickDelta, casterBatch);
         }
         catch (Throwable t)
         {
-            // A caster threw mid-build: flush now so its partial geometry ends
-            // here instead of merging into the next caster's quads, then let the
-            // batch continue clean. flushCasterBatch re-asserts the matrices, so
-            // the good casters buffered before this one still draw correctly.
-            flushCasterBatch(immediate);
+            // The caster threw mid-build: terminate its run now (drain the batch,
+            // re-asserting the light matrices) so its partial geometry ends here
+            // instead of merging into the next caster's quads.
+            casterBatch.terminateRun(currentView, currentProj);
         }
     }
 
@@ -267,7 +263,7 @@ public final class ShadowRenderer
         {
             if (inPass)
             {
-                flushCasterBatch(MinecraftClient.getInstance().getBufferBuilders().getEntityVertexConsumers());
+                flushCasterImmediate(MinecraftClient.getInstance().getBufferBuilders().getEntityVertexConsumers(), currentView, currentProj);
             }
         }
         finally
@@ -286,12 +282,22 @@ public final class ShadowRenderer
      *  batch flush does not. So re-assert the light's view/proj first: reload the
      *  current modelview-stack top to currentView (NO extra push — applyMatrices /
      *  endPass own the single push/pop) and restore the light projection. */
-    private static void flushCasterBatch(VertexConsumerProvider.Immediate immediate)
+    /** Drain the shared entity Immediate with a single draw, re-asserting the
+     *  light's {@code view}/{@code proj} first (INVARIANT 1): the batched draw
+     *  transforms its buffered world-space caster geometry by RenderSystem's LIVE
+     *  modelview/projection, which a caster baked earlier in the batch can leave
+     *  corrupted (a vanilla mob drawn through the EntityRenderer; the same
+     *  corruption the block/cutout paths dodge by passing matrices explicitly to
+     *  VertexBuffer.draw). The per-caster path got away without this because each
+     *  caster flushed right after applyMatrices set the state; a single end-of-batch
+     *  (or recovery) flush does not. Called by {@link #endCasterBatch} (success) and
+     *  {@link ImmediateOccluderBatch#terminateRun} (per-caster recovery, INVARIANT 4). */
+    static void flushCasterImmediate(VertexConsumerProvider.Immediate immediate, Matrix4f view, Matrix4f proj)
     {
-        RenderSystem.setProjectionMatrix(currentProj, VertexSorter.BY_DISTANCE);
+        RenderSystem.setProjectionMatrix(proj, VertexSorter.BY_DISTANCE);
         MatrixStack mv = RenderSystem.getModelViewStack();
         mv.loadIdentity();
-        mv.multiplyPositionMatrix(currentView);
+        mv.multiplyPositionMatrix(view);
         RenderSystem.applyModelViewMatrix();
         try
         {
@@ -300,20 +306,6 @@ public final class ShadowRenderer
         catch (Throwable t)
         {
             // swallow — a broken buffer must not abort the whole bake
-        }
-    }
-
-    private static void drawEntity(Entity entity, MatrixStack matrices, VertexConsumerProvider.Immediate immediate, float tickDelta)
-    {
-        double cx = MathHelper.lerp(tickDelta, entity.lastRenderX, entity.getX());
-        double cy = MathHelper.lerp(tickDelta, entity.lastRenderY, entity.getY());
-        double cz = MathHelper.lerp(tickDelta, entity.lastRenderZ, entity.getZ());
-        float yaw = entity.getYaw(tickDelta);
-
-        EntityRenderDispatcher dispatcher = MinecraftClient.getInstance().getEntityRenderDispatcher();
-        if (dispatcher != null)
-        {
-            dispatcher.render(entity, cx, cy, cz, yaw, tickDelta, matrices, immediate, FULL_LIGHT);
         }
     }
 

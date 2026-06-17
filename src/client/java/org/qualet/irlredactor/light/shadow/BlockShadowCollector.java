@@ -2,6 +2,8 @@ package org.qualet.irlredactor.light.shadow;
 
 import net.minecraft.block.BlockRenderType;
 import net.minecraft.block.BlockState;
+import net.minecraft.client.render.BlockRenderLayer;
+import net.minecraft.client.render.BlockRenderLayers;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.shape.VoxelShape;
@@ -84,15 +86,30 @@ public final class BlockShadowCollector
                     // inside its own shadow map.
                     if (state.getRenderType() == BlockRenderType.INVISIBLE) continue;
 
-                    // TODO(1.21.11 port): cutout-textured occluders (leaves /
-                    // glass / iron bars baked from their alpha-tested BakedModel
-                    // so transparent texels let light through) are not yet
-                    // re-implemented. RenderLayers.getBlockLayer(BlockState) was
-                    // removed in the 1.21.9 render rewrite, and the textured bake
-                    // depends on the new deferred render path. For now every block
-                    // is treated as an opaque-shape occluder (its culling/collision
-                    // /outline shape is baked by ShadowRenderer's raw-GL depth
-                    // pass). Restoring cutout transparency is a Stage-2/3 follow-up.
+                    // Cutout-textured occluders (leaves / glass panes / iron bars /
+                    // doors / foliage) are baked from their alpha-tested BakedModel
+                    // so transparent texels let light through, rather than casting a
+                    // solid shape silhouette. Classification mirrors 1.20.4's
+                    // RenderLayers.getBlockLayer; on 1.21.11 that API was renamed +
+                    // retyped to BlockRenderLayers.getBlockLayer -> BlockRenderLayer
+                    // enum. CUTOUT entries carry a null shape (the flag drives the
+                    // textured bake in ShadowRenderer); SOLID and TRANSLUCENT (e.g.
+                    // glass) keep the opaque-shape path, exactly as on 1.20.4 where
+                    // only the cutout layers were treated as textured.
+                    BlockRenderLayer layer;
+                    try
+                    {
+                        layer = BlockRenderLayers.getBlockLayer(state);
+                    }
+                    catch (Throwable t)
+                    {
+                        layer = BlockRenderLayer.SOLID;
+                    }
+                    if (layer == BlockRenderLayer.CUTOUT)
+                    {
+                        out.add(new BlockShadowEntry(mut.toImmutable(), null, true));
+                        continue;
+                    }
 
                     VoxelShape shape;
                     try

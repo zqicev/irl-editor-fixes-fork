@@ -1,13 +1,33 @@
 package org.qualet.irlredactor.light.shadow;
 
+import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import it.unimi.dsi.fastutil.objects.ObjectIterator;
+import net.minecraft.block.BlockState;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.render.block.BlockRenderManager;
+import net.minecraft.client.render.model.BakedQuad;
+import net.minecraft.client.render.model.BlockModelPart;
+import net.minecraft.client.render.model.BlockStateModel;
+import net.minecraft.client.texture.AbstractTexture;
+import net.minecraft.client.texture.GlTexture;
+import net.minecraft.client.texture.SpriteAtlasTexture;
+import net.minecraft.client.util.math.Vector2f;
+import net.minecraft.client.world.ClientWorld;
+import net.minecraft.entity.Entity;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.random.Random;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
+import org.joml.Vector3fc;
 import org.lwjgl.opengl.GL11;
+import org.lwjgl.opengl.GL13;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL20;
 import org.lwjgl.opengl.GL30;
@@ -37,10 +57,23 @@ import java.util.List;
  * MC's cache consistent (verified: the Stage-1 raw-GL FBO binds rendered clean
  * in-world with shaders on).</p>
  *
- * <p>STILL STUBBED: {@link #renderCaster} (entity occluders) — entity rendering is
- * now the deferred {@code OrderedRenderCommandQueue}; an approximate raw-GL box
- * occluder could be added here later. And nothing is VISIBLE until the GLSL/
- * {@code .irlights} patcher (Stage 3) makes a shaderpack sample these depth maps.</p>
+ * <p>ENTITY OCCLUDERS: {@link #renderCaster} draws each in-range entity's
+ * interpolated bounding box through the same depth program (an approximate "blob"
+ * shadow). 1.21.11 moved entity rendering to the deferred {@code
+ * OrderedRenderCommandQueue} (no immediate FBO rasterization) + the 1.21.9
+ * {@code EntityRenderState} rewrite, so a faithful model render is no longer
+ * reachable here; the box occluder is BBS-compatible and version-robust. The boxes
+ * of one pass are accumulated and flushed once in {@link #endPass}.</p>
+ *
+ * <p>CUTOUT OCCLUDERS: blocks classified {@code BlockRenderLayer.CUTOUT} by the
+ * collector (leaves / glass panes / iron bars / doors / foliage) are baked from
+ * their {@link BakedModel} quads through a second, textured depth program that
+ * samples the block atlas and discards transparent texels — so light passes
+ * through the holes (lacy shadows) instead of a solid block silhouette. See
+ * {@link #renderBlocksDepthCutout}.</p>
+ *
+ * <p>Nothing is VISIBLE until the GLSL/{@code .irlights} patcher (Stage 3) makes a
+ * shaderpack sample these depth maps.</p>
  *
  * <p>TODO(precision): vertices are absolute world coordinates, so the depth bake
  * loses float precision far from the world origin; switch to light-relative
@@ -94,6 +127,12 @@ public final class ShadowRenderer
     public static void beginBake()
     {
         passStateSaved = false;
+        // Drop any entity boxes a previous bake left unflushed (defensive; endPass
+        // flushes + clears every pass) so they can never draw with stale matrices.
+        if (casterBuf != null)
+        {
+            casterBuf.clear();
+        }
     }
 
     /**
@@ -191,24 +230,136 @@ public final class ShadowRenderer
         );
     }
 
+    /** Tiny inflation (blocks) on the entity box so a flat/thin entity (e.g. an
+     *  item) still writes a non-degenerate depth silhouette. */
+    private static final float ENTITY_BOX_INFLATE = 0.05f;
+    /** Max entity boxes accumulated per pass (one box = 36 verts). In-range
+     *  dynamic casters per light/face are few; extra are dropped (over-cap is a
+     *  missing shadow, never corruption). */
+    private static final int CASTER_MAX_BOXES = 64;
+    /** Accumulated entity-box vertices for the current pass; uploaded + drawn once
+     *  in {@link #endPass} so many entities cost a single draw + state snapshot. */
+    private static FloatBuffer casterBuf;
+    private static int casterScratchVbo = 0;
+
     /**
-     * Rasterize one occluder into the bound depth FBO. STUBBED for entities — see
-     * the class note. (Block occluders go through {@link #renderBlocksDepth}.)
-     *
-     * <p>TODO(Stage 3): entity occluders. The 1.20.4 path used the immediate
-     * entity dispatcher; 1.21.11's {@code EntityRenderManager.render} only enqueues
-     * onto a deferred {@code OrderedRenderCommandQueue}. An approximate fix is to
-     * draw the entity's interpolated bounding box through the depth program here
-     * (a blob occluder), which needs the entity's box passed down from
-     * {@link ShadowBaker}. No-op for now.</p>
+     * Accumulate one occluder for the current depth pass. Entities are drawn as
+     * their interpolated bounding box (a blob occluder) through the depth program
+     * — see the class note on why a faithful model render is not reachable on
+     * 1.21.11. Block occluders go through {@link #renderBlocksDepth}; model-block
+     * casters are not produced on this port, so only entities are handled here.
+     * The boxes are batched and flushed in {@link #endPass}.
      */
     public static void renderCaster(Object caster, int casterType, float tickDelta)
     {
-        if (caster == null || !inPass)
+        if (caster == null || !inPass || glBroken)
         {
             return;
         }
-        // TODO(Stage 3): entity-box occluder via the depth program.
+        if (!(caster instanceof Entity))
+        {
+            return; // model-block / replay casters not produced on the 1.21.11 port
+        }
+        if (!glInit)
+        {
+            initGl();
+        }
+        if (glBroken || program == 0)
+        {
+            return;
+        }
+
+        Entity e = (Entity) caster;
+        // entity.getBoundingBox() is at the current tick position; shift it by the
+        // render-interpolation delta so the shadow tracks the smoothed pose.
+        double ix = MathHelper.lerp(tickDelta, e.lastRenderX, e.getX()) - e.getX();
+        double iy = MathHelper.lerp(tickDelta, e.lastRenderY, e.getY()) - e.getY();
+        double iz = MathHelper.lerp(tickDelta, e.lastRenderZ, e.getZ()) - e.getZ();
+        Box box = e.getBoundingBox();
+        float m = ENTITY_BOX_INFLATE;
+
+        if (casterBuf == null)
+        {
+            casterBuf = MemoryUtil.memAllocFloat(CASTER_MAX_BOXES * 36 * 3);
+        }
+        if (casterBuf.remaining() < 36 * 3)
+        {
+            return; // pass is at the box cap
+        }
+        emitBox(casterBuf,
+            (float) (box.minX + ix) - m, (float) (box.minY + iy) - m, (float) (box.minZ + iz) - m,
+            (float) (box.maxX + ix) + m, (float) (box.maxY + iy) + m, (float) (box.maxZ + iz) + m);
+    }
+
+    /** Draw the entity boxes accumulated this pass (if any) with the depth
+     *  program, then reset the buffer. Called by {@link #endPass} before the GL
+     *  state is restored. Mirrors {@link #drawOpaqueBlocks}'s state discipline:
+     *  snapshot every global bit the draw mutates and restore it exactly. */
+    private static void flushCasterBoxes()
+    {
+        if (casterBuf == null || casterBuf.position() == 0 || glBroken || program == 0)
+        {
+            return;
+        }
+        int verts = casterBuf.position() / 3;
+        casterBuf.flip();
+
+        int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
+        int prevVao = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
+        int prevArrayBuf = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
+        boolean prevDepthTest = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
+        int prevDepthFunc = GL11.glGetInteger(GL11.GL_DEPTH_FUNC);
+        boolean prevDepthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+        boolean prevCull = GL11.glIsEnabled(GL11.GL_CULL_FACE);
+
+        try
+        {
+            GL11.glEnable(GL11.GL_DEPTH_TEST);
+            GL11.glDepthFunc(GL11.GL_LEQUAL);
+            GL11.glDepthMask(true);
+            GL11.glDisable(GL11.GL_CULL_FACE);
+
+            GL20.glUseProgram(program);
+            currentProj.mul(currentView, viewProj);
+            try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush())
+            {
+                FloatBuffer fb = stack.mallocFloat(16);
+                viewProj.get(fb);
+                GL20.glUniformMatrix4fv(uViewProjLoc, false, fb);
+            }
+
+            if (casterScratchVbo == 0)
+            {
+                casterScratchVbo = GL15.glGenBuffers();
+            }
+            GL30.glBindVertexArray(vao);
+            GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, casterScratchVbo);
+            GL15.glBufferData(GL15.GL_ARRAY_BUFFER, casterBuf, GL15.GL_STREAM_DRAW);
+            GL20.glEnableVertexAttribArray(0);
+            GL20.glVertexAttribPointer(0, 3, GL11.GL_FLOAT, false, 12, 0L);
+
+            GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, verts);
+        }
+        catch (Throwable t)
+        {
+            if (!blockErrorLogged)
+            {
+                blockErrorLogged = true;
+                System.err.println("[irl-redactor] entity shadow bake failed: " + t);
+                t.printStackTrace();
+            }
+        }
+        finally
+        {
+            GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, prevArrayBuf);
+            GL30.glBindVertexArray(prevVao);
+            GL20.glUseProgram(prevProgram);
+            GL11.glDepthMask(prevDepthMask);
+            GL11.glDepthFunc(prevDepthFunc);
+            if (prevDepthTest) { GL11.glEnable(GL11.GL_DEPTH_TEST); } else { GL11.glDisable(GL11.GL_DEPTH_TEST); }
+            if (prevCull) { GL11.glEnable(GL11.GL_CULL_FACE); } else { GL11.glDisable(GL11.GL_CULL_FACE); }
+            casterBuf.clear();
+        }
     }
 
     // --- Block-shadow depth bake (raw-GL) -------------------------------------
@@ -227,12 +378,31 @@ public final class ShadowRenderer
     private static final Long2IntOpenHashMap vboId = new Long2IntOpenHashMap();
     private static final Long2IntOpenHashMap vboVertCount = new Long2IntOpenHashMap();
 
+    // --- Cutout (textured, alpha-tested) block depth program + per-light cache ---
+    // Cutout blocks (leaves / glass panes / iron bars / doors / foliage; shape ==
+    // null in the entry) are baked from their BakedModel quads through a second
+    // depth program that samples the block atlas and discards transparent texels,
+    // so light passes through the holes. Vertices are interleaved POSITION(3) +
+    // UV(2) (stride 20). Per-light VBO cached + rebuilt on a list-instance change,
+    // exactly like the opaque path; evicted alongside it in retainBlockVbos.
+    private static int cutoutProgram = 0;
+    private static int cutoutViewProjLoc = -1;
+    private static int cutoutAtlasLoc = -1;
+    private static int cutoutVao = 0;
+    private static final Long2ObjectOpenHashMap<List<BlockShadowEntry>> cutoutList = new Long2ObjectOpenHashMap<>();
+    private static final Long2IntOpenHashMap cutoutVboId = new Long2IntOpenHashMap();
+    private static final Long2IntOpenHashMap cutoutVertCount = new Long2IntOpenHashMap();
+    private static final Random cutoutRandom = Random.create();
+    private static boolean cutoutErrorLogged = false;
+
     private static boolean blockErrorLogged = false;
 
     /**
      * Render a light's block occluders into the currently-bound depth FBO, between
-     * a begin*()/endPass() bracket. Draws each block's {@link BlockShadowEntry#shape}
-     * AABBs as triangles with the per-light view/projection.
+     * a begin*()/endPass() bracket. Opaque-shape blocks are drawn as their
+     * {@link BlockShadowEntry#shape} AABB triangles; cutout blocks (shape == null)
+     * are drawn from their textured {@link BakedQuad} geometry with alpha discard
+     * (see {@link #renderBlocksDepthCutout}). Both use the per-light view/proj.
      */
     public static void renderBlocksDepth(long id, List<BlockShadowEntry> blocks)
     {
@@ -240,20 +410,32 @@ public final class ShadowRenderer
         {
             return;
         }
-
         if (!glInit)
         {
             initGl();
         }
-        if (glBroken || program == 0)
+        if (glBroken)
+        {
+            return;
+        }
+        drawOpaqueBlocks(id, blocks);
+        renderBlocksDepthCutout(id, blocks);
+    }
+
+    /** Draw the opaque-shape (non-cutout) blocks of a light as triangle AABBs. */
+    private static void drawOpaqueBlocks(long id, List<BlockShadowEntry> blocks)
+    {
+        if (program == 0)
         {
             return;
         }
 
         // (Re)build this light's VBO only when its block list instance changed.
-        int vbo = vboId.get(id);
+        // Keyed on the list instance alone (not vbo != 0): buildVbo stores the
+        // instance even when there is no shaped geometry (a cutout-only lamp), so
+        // gating on vbo would re-tessellate that empty lamp every frame.
         int verts;
-        if (vbo == 0 || vboList.get(id) != blocks)
+        if (vboList.get(id) != blocks)
         {
             verts = buildVbo(id, blocks);
         }
@@ -265,7 +447,7 @@ public final class ShadowRenderer
         {
             return;
         }
-        vbo = vboId.get(id);
+        int vbo = vboId.get(id);
 
         // Snapshot every global GL state the draw mutates, then restore it — MC's
         // GlStateManager doesn't cache program/VAO/buffer, and the FBO/viewport are
@@ -420,6 +602,289 @@ public final class ShadowRenderer
         b.put(cx).put(cy).put(cz);
     }
 
+    // --- Cutout block depth bake (textured, alpha-tested) ---------------------
+
+    private static final Direction[] DIRECTIONS = Direction.values();
+
+    /**
+     * Draw a light's cutout blocks from their textured {@link BakedQuad} geometry,
+     * sampling the block atlas and discarding transparent texels so light passes
+     * through (lacy leaf / grate / glass-pane shadows). Per-light VBO cached like
+     * the opaque path. Called from {@link #renderBlocksDepth} within a pass.
+     */
+    private static void renderBlocksDepthCutout(long id, List<BlockShadowEntry> blocks)
+    {
+        if (cutoutProgram == 0)
+        {
+            return;
+        }
+
+        // Keyed on the list instance alone (see drawOpaqueBlocks): buildCutoutVbo
+        // stores the instance even with zero quads, so this won't re-tessellate an
+        // empty lamp every frame.
+        int verts;
+        if (cutoutList.get(id) != blocks)
+        {
+            verts = buildCutoutVbo(id, blocks);
+        }
+        else
+        {
+            verts = cutoutVertCount.get(id);
+        }
+        if (verts <= 0)
+        {
+            return;
+        }
+        int vbo = cutoutVboId.get(id);
+
+        int atlas = atlasGlId();
+        if (atlas == 0)
+        {
+            return; // atlas texture not ready this frame
+        }
+
+        // Snapshot every global GL bit the draw mutates (program/VAO/buffer, depth,
+        // cull, blend, active texture unit + its 2D binding) and restore it, like
+        // the opaque path — keeps the surrounding renderer's GL state consistent.
+        int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
+        int prevVao = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
+        int prevArrayBuf = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
+        boolean prevDepthTest = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
+        int prevDepthFunc = GL11.glGetInteger(GL11.GL_DEPTH_FUNC);
+        boolean prevDepthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+        boolean prevCull = GL11.glIsEnabled(GL11.GL_CULL_FACE);
+        boolean prevBlend = GL11.glIsEnabled(GL11.GL_BLEND);
+        int prevActiveTex = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
+        GL13.glActiveTexture(GL13.GL_TEXTURE0);
+        int prevTex0 = GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D);
+
+        try
+        {
+            GL11.glEnable(GL11.GL_DEPTH_TEST);
+            GL11.glDepthFunc(GL11.GL_LEQUAL);
+            GL11.glDepthMask(true);
+            GL11.glDisable(GL11.GL_CULL_FACE);
+            GL11.glDisable(GL11.GL_BLEND);
+
+            GL20.glUseProgram(cutoutProgram);
+            currentProj.mul(currentView, viewProj);
+            try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush())
+            {
+                FloatBuffer fb = stack.mallocFloat(16);
+                viewProj.get(fb);
+                GL20.glUniformMatrix4fv(cutoutViewProjLoc, false, fb);
+            }
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, atlas);
+            GL20.glUniform1i(cutoutAtlasLoc, 0);
+
+            GL30.glBindVertexArray(cutoutVao);
+            GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo);
+            GL20.glEnableVertexAttribArray(0);
+            GL20.glEnableVertexAttribArray(1);
+            GL20.glVertexAttribPointer(0, 3, GL11.GL_FLOAT, false, 20, 0L);
+            GL20.glVertexAttribPointer(1, 2, GL11.GL_FLOAT, false, 20, 12L);
+
+            GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, verts);
+        }
+        catch (Throwable t)
+        {
+            if (!cutoutErrorLogged)
+            {
+                cutoutErrorLogged = true;
+                System.err.println("[irl-redactor] cutout block shadow bake failed: " + t);
+                t.printStackTrace();
+            }
+        }
+        finally
+        {
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, prevTex0);
+            GL13.glActiveTexture(prevActiveTex);
+            GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, prevArrayBuf);
+            GL30.glBindVertexArray(prevVao);
+            GL20.glUseProgram(prevProgram);
+            GL11.glDepthMask(prevDepthMask);
+            GL11.glDepthFunc(prevDepthFunc);
+            if (prevDepthTest) { GL11.glEnable(GL11.GL_DEPTH_TEST); } else { GL11.glDisable(GL11.GL_DEPTH_TEST); }
+            if (prevCull) { GL11.glEnable(GL11.GL_CULL_FACE); } else { GL11.glDisable(GL11.GL_CULL_FACE); }
+            if (prevBlend) { GL11.glEnable(GL11.GL_BLEND); } else { GL11.glDisable(GL11.GL_BLEND); }
+        }
+    }
+
+    /** Build (or rebuild) a light's cutout VBO (interleaved POSITION(3)+UV(2),
+     *  stride 20) from its cutout entries' BakedModel quads. Returns the vertex
+     *  count (0 if there is no cutout geometry). Quads are emitted with absolute
+     *  world coordinates (model-local position + block origin), matching the
+     *  opaque path; neighbour face-culling is skipped (over-draw is safe for a
+     *  silhouette and avoids needing the world-aware tessellator). */
+    private static int buildCutoutVbo(long id, List<BlockShadowEntry> blocks)
+    {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        ClientWorld world = mc != null ? mc.world : null;
+        BlockRenderManager brm = mc != null ? mc.getBlockRenderManager() : null;
+        if (world == null || brm == null)
+        {
+            releaseCutoutVbo(id);
+            cutoutList.put(id, blocks);
+            cutoutVertCount.put(id, 0);
+            return 0;
+        }
+
+        FloatArrayList data = new FloatArrayList();
+        for (int i = 0, n = blocks.size(); i < n; i++)
+        {
+            BlockShadowEntry e = blocks.get(i);
+            if (e == null || !e.cutout)
+            {
+                continue;
+            }
+            BlockPos p = e.pos;
+            try
+            {
+                BlockState state = world.getBlockState(p);
+                if (state.isAir())
+                {
+                    continue;
+                }
+                BlockStateModel model = brm.getModel(state);
+                if (model == null)
+                {
+                    continue;
+                }
+                cutoutRandom.setSeed(state.getRenderingSeed(p));
+                List<BlockModelPart> parts = model.getParts(cutoutRandom);
+                float ox = p.getX(), oy = p.getY(), oz = p.getZ();
+                for (int pi = 0, pn = parts.size(); pi < pn; pi++)
+                {
+                    BlockModelPart part = parts.get(pi);
+                    if (part == null)
+                    {
+                        continue;
+                    }
+                    emitCutoutQuads(data, part.getQuads(null), ox, oy, oz);
+                    for (Direction d : DIRECTIONS)
+                    {
+                        emitCutoutQuads(data, part.getQuads(d), ox, oy, oz);
+                    }
+                }
+            }
+            catch (Throwable t)
+            {
+                // skip a single broken block, keep tessellating the rest
+            }
+        }
+
+        int floats = data.size();
+        if (floats == 0)
+        {
+            releaseCutoutVbo(id);
+            cutoutList.put(id, blocks);
+            cutoutVertCount.put(id, 0);
+            return 0;
+        }
+        int verts = floats / 5;
+
+        FloatBuffer fb = MemoryUtil.memAllocFloat(floats);
+        try
+        {
+            fb.put(data.elements(), 0, floats);
+            fb.flip();
+
+            int vbo = cutoutVboId.get(id);
+            if (vbo == 0)
+            {
+                vbo = GL15.glGenBuffers();
+                cutoutVboId.put(id, vbo);
+            }
+            int prevArrayBuf = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
+            GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vbo);
+            GL15.glBufferData(GL15.GL_ARRAY_BUFFER, fb, GL15.GL_STATIC_DRAW);
+            GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, prevArrayBuf);
+
+            cutoutList.put(id, blocks);
+            cutoutVertCount.put(id, verts);
+            return verts;
+        }
+        finally
+        {
+            MemoryUtil.memFree(fb);
+        }
+    }
+
+    /** Append a quad list as triangles (POSITION+UV) to the cutout vertex data. */
+    private static void emitCutoutQuads(FloatArrayList out, List<BakedQuad> quads, float ox, float oy, float oz)
+    {
+        if (quads == null)
+        {
+            return;
+        }
+        for (int i = 0, n = quads.size(); i < n; i++)
+        {
+            BakedQuad q = quads.get(i);
+            if (q == null)
+            {
+                continue;
+            }
+            // quad corners 0,1,2,3 -> two triangles (0,1,2) + (0,2,3)
+            appendCutoutVert(out, q, 0, ox, oy, oz);
+            appendCutoutVert(out, q, 1, ox, oy, oz);
+            appendCutoutVert(out, q, 2, ox, oy, oz);
+            appendCutoutVert(out, q, 0, ox, oy, oz);
+            appendCutoutVert(out, q, 2, ox, oy, oz);
+            appendCutoutVert(out, q, 3, ox, oy, oz);
+        }
+    }
+
+    private static void appendCutoutVert(FloatArrayList out, BakedQuad q, int i, float ox, float oy, float oz)
+    {
+        Vector3fc pos = q.getPosition(i);
+        long uv = q.getTexcoords(i);
+        out.add(pos.x() + ox);
+        out.add(pos.y() + oy);
+        out.add(pos.z() + oz);
+        out.add(Vector2f.getX(uv));
+        out.add(Vector2f.getY(uv));
+    }
+
+    /** Raw GL id of the block atlas texture, or 0 if it is not allocated yet. */
+    private static int atlasGlId()
+    {
+        try
+        {
+            MinecraftClient mc = MinecraftClient.getInstance();
+            if (mc == null)
+            {
+                return 0;
+            }
+            AbstractTexture tex = mc.getTextureManager().getTexture(SpriteAtlasTexture.BLOCK_ATLAS_TEXTURE);
+            if (tex == null)
+            {
+                return 0;
+            }
+            com.mojang.blaze3d.textures.GpuTexture gt = tex.getGlTexture();
+            if (gt instanceof GlTexture)
+            {
+                return ((GlTexture) gt).getGlId();
+            }
+            return 0;
+        }
+        catch (Throwable t)
+        {
+            return 0;
+        }
+    }
+
+    /** Free one lamp's cached cutout VBO. */
+    private static void releaseCutoutVbo(long id)
+    {
+        int vbo = cutoutVboId.remove(id);
+        if (vbo != 0)
+        {
+            GL15.glDeleteBuffers(vbo);
+        }
+        cutoutList.remove(id);
+        cutoutVertCount.remove(id);
+    }
+
     /** Lazily compile the depth program + create the shared VAO. */
     private static void initGl()
     {
@@ -450,6 +915,39 @@ public final class ShadowRenderer
             program = prog;
             uViewProjLoc = GL20.glGetUniformLocation(prog, "uViewProj");
             vao = GL30.glGenVertexArrays();
+
+            // Cutout depth program: positions + atlas UVs, discards transparent
+            // texels so light passes through the holes in the texture.
+            int cvs = compile(GL20.GL_VERTEX_SHADER,
+                "#version 150\n" +
+                "in vec3 aPos;\n" +
+                "in vec2 aUV;\n" +
+                "uniform mat4 uViewProj;\n" +
+                "out vec2 vUV;\n" +
+                "void main() { vUV = aUV; gl_Position = uViewProj * vec4(aPos, 1.0); }\n");
+            int cfs = compile(GL20.GL_FRAGMENT_SHADER,
+                "#version 150\n" +
+                "in vec2 vUV;\n" +
+                "uniform sampler2D uAtlas;\n" +
+                "void main() { if (texture(uAtlas, vUV).a < 0.5) discard; }\n");
+
+            int cprog = GL20.glCreateProgram();
+            GL20.glAttachShader(cprog, cvs);
+            GL20.glAttachShader(cprog, cfs);
+            GL20.glBindAttribLocation(cprog, 0, "aPos");
+            GL20.glBindAttribLocation(cprog, 1, "aUV");
+            GL20.glLinkProgram(cprog);
+            if (GL20.glGetProgrami(cprog, GL20.GL_LINK_STATUS) == GL11.GL_FALSE)
+            {
+                throw new IllegalStateException("cutout link: " + GL20.glGetProgramInfoLog(cprog));
+            }
+            GL20.glDeleteShader(cvs);
+            GL20.glDeleteShader(cfs);
+
+            cutoutProgram = cprog;
+            cutoutViewProjLoc = GL20.glGetUniformLocation(cprog, "uViewProj");
+            cutoutAtlasLoc = GL20.glGetUniformLocation(cprog, "uAtlas");
+            cutoutVao = GL30.glGenVertexArrays();
         }
         catch (Throwable t)
         {
@@ -483,27 +981,47 @@ public final class ShadowRenderer
         vboVertCount.remove(id);
     }
 
-    /** Free block VBOs for lamps not in {@code liveIds} (gone, or feature off ->
-     *  empty set drains all). Run once per bake after the light loops. */
+    /** Free block VBOs (opaque + cutout) for lamps not in {@code liveIds} (gone,
+     *  or feature off -> empty set drains all). Run once per bake after the light
+     *  loops. A lamp with only cutout blocks isn't in the opaque {@link #vboList},
+     *  so the cutout cache is swept separately. */
     public static void retainBlockVbos(LongSet liveIds)
     {
-        if (vboId.isEmpty())
+        if (!vboId.isEmpty())
         {
-            return;
-        }
-        ObjectIterator<Long2ObjectMap.Entry<List<BlockShadowEntry>>> it = vboList.long2ObjectEntrySet().iterator();
-        while (it.hasNext())
-        {
-            long key = it.next().getLongKey();
-            if (!liveIds.contains(key))
+            ObjectIterator<Long2ObjectMap.Entry<List<BlockShadowEntry>>> it = vboList.long2ObjectEntrySet().iterator();
+            while (it.hasNext())
             {
-                int vbo = vboId.remove(key);
-                if (vbo != 0)
+                long key = it.next().getLongKey();
+                if (!liveIds.contains(key))
                 {
-                    GL15.glDeleteBuffers(vbo);
+                    int vbo = vboId.remove(key);
+                    if (vbo != 0)
+                    {
+                        GL15.glDeleteBuffers(vbo);
+                    }
+                    vboVertCount.remove(key);
+                    it.remove();
                 }
-                vboVertCount.remove(key);
-                it.remove();
+            }
+        }
+
+        if (!cutoutVboId.isEmpty())
+        {
+            ObjectIterator<Long2ObjectMap.Entry<List<BlockShadowEntry>>> it = cutoutList.long2ObjectEntrySet().iterator();
+            while (it.hasNext())
+            {
+                long key = it.next().getLongKey();
+                if (!liveIds.contains(key))
+                {
+                    int vbo = cutoutVboId.remove(key);
+                    if (vbo != 0)
+                    {
+                        GL15.glDeleteBuffers(vbo);
+                    }
+                    cutoutVertCount.remove(key);
+                    it.remove();
+                }
             }
         }
     }
@@ -514,6 +1032,10 @@ public final class ShadowRenderer
         {
             return;
         }
+
+        // Draw the entity boxes accumulated in this pass before restoring state
+        // (they share the pass's currentView/currentProj, still set here).
+        flushCasterBoxes();
 
         GL11.glDepthMask(savedDepthMask);
 

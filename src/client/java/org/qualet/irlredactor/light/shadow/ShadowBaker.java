@@ -105,6 +105,26 @@ public final class ShadowBaker
      *  (static) occluders. */
     private static int staticInRangeScratch;
 
+    // --- Per-light occluder shortlist (built once per light by scanInRange) ---
+    // scanInRange used to be one of several walks over occ[] applying the same
+    // range/cone/face predicate (the others being the renderInRange* passes and
+    // a per-face faceHasDynamic probe, both now removed). It records the in-range
+    // occluders into a shortlist so the render passes just iterate that — one
+    // source of truth for "what's in range", which both saves the re-walks and
+    // tightens the scan==render invariant. The shortlist
+    // and its masks live only for the current light: scanInRange runs per light
+    // immediately before that light's render passes, and the spot loop fully
+    // precedes the point loop, so no pass ever straddles two scanInRange calls.
+    private static final int[] shortIdx = new int[MAX_OCCLUDERS];
+    /** Per-shortlist-slot 6-bit mask of the cube faces this occluder's sphere
+     *  touches (point lights only; 0/unused on the spot scan, cone==true). */
+    private static final int[] shortFaceMask = new int[MAX_OCCLUDERS];
+    /** Number of valid entries in {@link #shortIdx}/{@link #shortFaceMask}. */
+    private static int shortCount;
+    /** OR of the {@link #shortFaceMask} bits of in-range DYNAMIC occluders —
+     *  the faces the overlay pass must re-copy + redraw (point lights). */
+    private static int dynFaceMaskScratch;
+
     // --- Sticky tile / cube-slot ownership ------------------------------------
     // A light KEEPS its atlas tile / cube slot across frames — including frames
     // where it is culled, toggled off, or has nothing in range — so one light
@@ -311,7 +331,7 @@ public final class ShadowBaker
                 ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, false, true);
                 if (entInRange > 0)
                 {
-                    renderInRangeCone(lx, ly, lz, range, ndx, ndy, ndz, coneTheta, CASTERS_ALL, tickDelta);
+                    renderInRangeCone(CASTERS_ALL, tickDelta);
                 }
                 if (!blocks.isEmpty())
                 {
@@ -339,7 +359,7 @@ public final class ShadowBaker
                     ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, false, true);
                     if (staticInRangeScratch > 0)
                     {
-                        renderInRangeCone(lx, ly, lz, range, ndx, ndy, ndz, coneTheta, CASTERS_STATIC, tickDelta);
+                        renderInRangeCone(CASTERS_STATIC, tickDelta);
                     }
                     if (!blocks.isEmpty())
                     {
@@ -371,7 +391,7 @@ public final class ShadowBaker
                     ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, true, true);
                     if (staticInRangeScratch > 0)
                     {
-                        renderInRangeCone(lx, ly, lz, range, ndx, ndy, ndz, coneTheta, CASTERS_STATIC, tickDelta);
+                        renderInRangeCone(CASTERS_STATIC, tickDelta);
                     }
                     if (!blocks.isEmpty())
                     {
@@ -390,7 +410,7 @@ public final class ShadowBaker
                         profSpotOverlays++;
                     }
                     ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, false, false);
-                    renderInRangeCone(lx, ly, lz, range, ndx, ndy, ndz, coneTheta, CASTERS_DYNAMIC, tickDelta);
+                    renderInRangeCone(CASTERS_DYNAMIC, tickDelta);
                     ShadowRenderer.endPass();
                 }
             }
@@ -404,7 +424,7 @@ public final class ShadowBaker
                 ShadowRenderer.beginSpot(myTile, lx, ly, lz, dx, dy, dz, range, outerDeg, false, true);
                 if (dyn)
                 {
-                    renderInRangeCone(lx, ly, lz, range, ndx, ndy, ndz, coneTheta, CASTERS_DYNAMIC, tickDelta);
+                    renderInRangeCone(CASTERS_DYNAMIC, tickDelta);
                 }
                 ShadowRenderer.endPass();
             }
@@ -477,7 +497,7 @@ public final class ShadowBaker
                     ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, false, true);
                     if (entInRange > 0)
                     {
-                        renderInRangeFace(lx, ly, lz, radius, face, CASTERS_ALL, tickDelta);
+                        renderInRangeFace(face, CASTERS_ALL, tickDelta);
                     }
                     if (!blocks.isEmpty())
                     {
@@ -507,7 +527,7 @@ public final class ShadowBaker
                         ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, false, true);
                         if (staticInRangeScratch > 0)
                         {
-                            renderInRangeFace(lx, ly, lz, radius, face, CASTERS_STATIC, tickDelta);
+                            renderInRangeFace(face, CASTERS_STATIC, tickDelta);
                         }
                         if (!blocks.isEmpty())
                         {
@@ -540,7 +560,7 @@ public final class ShadowBaker
                         ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, true, true);
                         if (staticInRangeScratch > 0)
                         {
-                            renderInRangeFace(lx, ly, lz, radius, face, CASTERS_STATIC, tickDelta);
+                            renderInRangeFace(face, CASTERS_STATIC, tickDelta);
                         }
                         if (!blocks.isEmpty())
                         {
@@ -561,12 +581,12 @@ public final class ShadowBaker
                     }
                     for (int face = 0; face < 6; face++)
                     {
-                        if (!faceHasDynamic(lx, ly, lz, radius, face))
+                        if ((dynFaceMaskScratch & (1 << face)) == 0)
                         {
                             continue; // the copy already refreshed this face
                         }
                         ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, false, false);
-                        renderInRangeFace(lx, ly, lz, radius, face, CASTERS_DYNAMIC, tickDelta);
+                        renderInRangeFace(face, CASTERS_DYNAMIC, tickDelta);
                         ShadowRenderer.endPass();
                     }
                 }
@@ -584,7 +604,7 @@ public final class ShadowBaker
                     ShadowRenderer.beginPointFace(myLayer, face, lx, ly, lz, radius, false, true);
                     if (dyn)
                     {
-                        renderInRangeFace(lx, ly, lz, radius, face, CASTERS_DYNAMIC, tickDelta);
+                        renderInRangeFace(face, CASTERS_DYNAMIC, tickDelta);
                     }
                     ShadowRenderer.endPass();
                 }
@@ -866,6 +886,8 @@ public final class ShadowBaker
         int statics = 0;
         boolean dyn = false;
         long sig = 0L;
+        shortCount = 0;
+        dynFaceMaskScratch = 0;
         for (int k = 0; k < occCount; k++)
         {
             float ddx = ox[k] - lx, ddy = oy[k] - ly, ddz = oz[k] - lz;
@@ -878,6 +900,25 @@ public final class ShadowBaker
             {
                 continue;
             }
+
+            // In range (and inside the cone for spots): add to the shortlist and,
+            // for points, precompute the 6-bit face mask the render passes reuse.
+            int slot = shortCount++;
+            shortIdx[slot] = k;
+            int mask = 0;
+            if (!cone)
+            {
+                float sr = orad[k] * SQRT2;
+                for (int face = 0; face < 6; face++)
+                {
+                    if (sphereTouchesFace(face, ddx, ddy, ddz, sr))
+                    {
+                        mask |= (1 << face);
+                    }
+                }
+            }
+            shortFaceMask[slot] = mask;
+
             c++;
             if (occType[k] == ShadowRenderer.CASTER_MODEL_BLOCK)
             {
@@ -887,6 +928,7 @@ public final class ShadowBaker
             else
             {
                 dyn = true; // entity or film replay -> dynamic subject
+                dynFaceMaskScratch |= mask;
             }
         }
         dynamicInRangeScratch = dyn;
@@ -915,52 +957,15 @@ public final class ShadowBaker
         return true;
     }
 
-    /** True when any in-range DYNAMIC occluder's sphere touches this cube
-     *  face's frustum — lets the overlay pass skip faces that the static
-     *  copy already refreshed. */
-    private static boolean faceHasDynamic(float lx, float ly, float lz, float reachBase, int face)
+    /** Render the shortlisted occluders of the filtered type (the shortlist is
+     *  the spot's in-range, in-cone set built by {@link #scanInRange}, so the
+     *  rendered set equals the counted set that gated this bake). */
+    private static void renderInRangeCone(int filter, float tickDelta)
     {
-        for (int k = 0; k < occCount; k++)
+        for (int s = 0; s < shortCount; s++)
         {
-            if (occType[k] == ShadowRenderer.CASTER_MODEL_BLOCK)
-            {
-                continue;
-            }
-            float vx = ox[k] - lx, vy = oy[k] - ly, vz = oz[k] - lz;
-            float reach = reachBase + orad[k];
-            if (vx * vx + vy * vy + vz * vz > reach * reach)
-            {
-                continue;
-            }
-            if (sphereTouchesFace(face, vx, vy, vz, orad[k] * SQRT2))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /** Render in-range occluders of the filtered type inside a spot's lit cone
-     *  (see {@link #insideCone}). The range + cone tests must match
-     *  {@link #scanInRange} exactly, so the rendered set equals the counted set
-     *  that gated this bake. */
-    private static void renderInRangeCone(float lx, float ly, float lz, float reachBase,
-                                          float dirX, float dirY, float dirZ, float coneTheta,
-                                          int filter, float tickDelta)
-    {
-        for (int k = 0; k < occCount; k++)
-        {
+            int k = shortIdx[s];
             if (!casterMatches(filter, occType[k]))
-            {
-                continue;
-            }
-            float ddx = ox[k] - lx, ddy = oy[k] - ly, ddz = oz[k] - lz;
-            float reach = reachBase + orad[k];
-            if (ddx * ddx + ddy * ddy + ddz * ddz > reach * reach)
-            {
-                continue;
-            }
-            if (!insideCone(dirX, dirY, dirZ, coneTheta, ddx, ddy, ddz, orad[k]))
             {
                 continue;
             }
@@ -968,26 +973,21 @@ public final class ShadowBaker
         }
     }
 
-    /** Render in-range occluders of the filtered type that could intersect ONE
-     *  point-cube face's 90° frustum (face index per
-     *  {@link ShadowRenderer#beginPointFace}); the other five faces never see
-     *  them, removing ~5/6 of the caster draws per point. */
-    private static void renderInRangeFace(float lx, float ly, float lz, float reachBase, int face,
-                                          int filter, float tickDelta)
+    /** Render the shortlisted occluders of the filtered type whose precomputed
+     *  face mask ({@link #scanInRange}) touches ONE point-cube face's 90° frustum
+     *  (face index per {@link ShadowRenderer#beginPointFace}); the other five
+     *  faces never see them, removing ~5/6 of the caster draws per point. */
+    private static void renderInRangeFace(int face, int filter, float tickDelta)
     {
-        for (int k = 0; k < occCount; k++)
+        int bit = 1 << face;
+        for (int s = 0; s < shortCount; s++)
         {
+            if ((shortFaceMask[s] & bit) == 0)
+            {
+                continue;
+            }
+            int k = shortIdx[s];
             if (!casterMatches(filter, occType[k]))
-            {
-                continue;
-            }
-            float vx = ox[k] - lx, vy = oy[k] - ly, vz = oz[k] - lz;
-            float reach = reachBase + orad[k];
-            if (vx * vx + vy * vy + vz * vz > reach * reach)
-            {
-                continue;
-            }
-            if (!sphereTouchesFace(face, vx, vy, vz, orad[k] * SQRT2))
             {
                 continue;
             }

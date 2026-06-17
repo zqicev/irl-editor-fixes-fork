@@ -49,6 +49,11 @@ public final class BlockShadowCache
         long hash;
         List<BlockShadowEntry> list;
         long[] sectionKeys;
+        /** Snapped collection center + padded radius this entry was collected
+         *  with (see {@link #getOrCompute}). Lets {@link #invalidateAt} reject a
+         *  block edit that lands in a touched chunk-section but outside the
+         *  actual sphere, mirroring the collector's per-block keep test exactly. */
+        float cx, cy, cz, cr;
     }
 
     private static final Long2ObjectOpenHashMap<CacheEntry> byId = new Long2ObjectOpenHashMap<>();
@@ -100,6 +105,10 @@ public final class BlockShadowCache
         }
         e.list = fresh;
         e.hash = h;
+        e.cx = cx;
+        e.cy = cy;
+        e.cz = cz;
+        e.cr = cr;
         rebuildSectionIndex(id, e, cx, cy, cz, cr);
         return fresh;
     }
@@ -118,15 +127,29 @@ public final class BlockShadowCache
         {
             return false;
         }
+        // The section index is a coarse bbox pre-filter: a section the sphere's
+        // bounding box clips may have corners well outside the sphere. Reject any
+        // edit whose block center sits beyond the snapped collection radius — the
+        // exact same keep test BlockShadowCollector applied per block — so a block
+        // change in a far corner of a touched section costs no needless rebake.
+        float bcx = pos.getX() + 0.5f;
+        float bcy = pos.getY() + 0.5f;
+        float bcz = pos.getZ() + 0.5f;
         boolean any = false;
         for (LongIterator it = ids.iterator(); it.hasNext(); )
         {
             CacheEntry e = byId.get(it.nextLong());
-            if (e != null)
+            if (e == null)
             {
-                e.hash = EMPTY;
-                any = true;
+                continue;
             }
+            float dx = bcx - e.cx, dy = bcy - e.cy, dz = bcz - e.cz;
+            if (dx * dx + dy * dy + dz * dz > e.cr * e.cr)
+            {
+                continue; // inside the section bbox but outside the sphere
+            }
+            e.hash = EMPTY;
+            any = true;
         }
         return any;
     }

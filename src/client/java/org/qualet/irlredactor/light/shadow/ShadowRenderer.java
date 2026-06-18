@@ -1,6 +1,7 @@
 package org.qualet.irlredactor.light.shadow;
 
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
@@ -9,23 +10,15 @@ import it.unimi.dsi.fastutil.objects.ObjectIterator;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.block.BlockRenderManager;
-import net.minecraft.client.render.model.BakedQuad;
-import net.minecraft.client.render.model.BlockModelPart;
-import net.minecraft.client.render.model.BlockStateModel;
 import net.minecraft.client.texture.AbstractTexture;
 import net.minecraft.client.texture.GlTexture;
 import net.minecraft.client.texture.SpriteAtlasTexture;
-import net.minecraft.client.util.math.Vector2f;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
-import net.minecraft.util.math.Box;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.random.Random;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
-import org.joml.Vector3fc;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL13;
 import org.lwjgl.opengl.GL15;
@@ -57,20 +50,24 @@ import java.util.List;
  * MC's cache consistent (verified: the Stage-1 raw-GL FBO binds rendered clean
  * in-world with shaders on).</p>
  *
- * <p>ENTITY OCCLUDERS: {@link #renderCaster} draws each in-range entity's
- * interpolated bounding box through the same depth program (an approximate "blob"
- * shadow). 1.21.11 moved entity rendering to the deferred {@code
- * OrderedRenderCommandQueue} (no immediate FBO rasterization) + the 1.21.9
- * {@code EntityRenderState} rewrite, so a faithful model render is no longer
- * reachable here; the box occluder is BBS-compatible and version-robust. The boxes
- * of one pass are accumulated and flushed once in {@link #endPass}.</p>
+ * <p>ENTITY OCCLUDERS: {@link #renderCaster} bakes each in-range entity's REAL
+ * model silhouette. 1.21.11 moved entity rendering to the deferred {@code
+ * OrderedRenderCommandQueue} + the 1.21.9 {@code EntityRenderState} rewrite (no
+ * immediate FBO rasterization), so {@link OccluderGeometryCapturer} runs the
+ * actual entity render through a capturing queue, collects the model triangles in
+ * world space, and this class rasterizes them with the depth program — the
+ * 1.21.11 equivalent of the 1.20.4/1.21.1 {@code dispatcher.render(...,Immediate)}
+ * path. Each entity is captured once per bake (geometry is view-independent) and
+ * reused across every tile/face; the triangles of one pass are accumulated and
+ * flushed once in {@link #endPass}.</p>
  *
  * <p>CUTOUT OCCLUDERS: blocks classified {@code BlockRenderLayer.CUTOUT} by the
  * collector (leaves / glass panes / iron bars / doors / foliage) are baked from
- * their {@link BakedModel} quads through a second, textured depth program that
- * samples the block atlas and discards transparent texels — so light passes
- * through the holes (lacy shadows) instead of a solid block silhouette. See
- * {@link #renderBlocksDepthCutout}.</p>
+ * MC's real {@code BlockRenderManager.renderBlock} tessellation (neighbour-culled,
+ * correct atlas UVs — again via {@link OccluderGeometryCapturer}) through a second,
+ * textured depth program that samples the block atlas and discards transparent
+ * texels, so light passes through the holes (lacy shadows) instead of a solid
+ * block silhouette. See {@link #renderBlocksDepthCutout}.</p>
  *
  * <p>Nothing is VISIBLE until the GLSL/{@code .irlights} patcher (Stage 3) makes a
  * shaderpack sample these depth maps.</p>
@@ -127,12 +124,10 @@ public final class ShadowRenderer
     public static void beginBake()
     {
         passStateSaved = false;
-        // Drop any entity boxes a previous bake left unflushed (defensive; endPass
-        // flushes + clears every pass) so they can never draw with stale matrices.
-        if (casterBuf != null)
-        {
-            casterBuf.clear();
-        }
+        // New bake: drop last bake's per-entity captures (entities moved/animated)
+        // and any unflushed pass triangles (defensive; endPass clears every pass).
+        entityGeom.clear();
+        casterAccum.clear();
     }
 
     /**
@@ -230,25 +225,32 @@ public final class ShadowRenderer
         );
     }
 
-    /** Tiny inflation (blocks) on the entity box so a flat/thin entity (e.g. an
-     *  item) still writes a non-degenerate depth silhouette. */
-    private static final float ENTITY_BOX_INFLATE = 0.05f;
-    /** Max entity boxes accumulated per pass (one box = 36 verts). In-range
-     *  dynamic casters per light/face are few; extra are dropped (over-cap is a
-     *  missing shadow, never corruption). */
-    private static final int CASTER_MAX_BOXES = 64;
-    /** Accumulated entity-box vertices for the current pass; uploaded + drawn once
-     *  in {@link #endPass} so many entities cost a single draw + state snapshot. */
-    private static FloatBuffer casterBuf;
+    /** Captured world-space silhouette triangles (POSITION xyz) per entity, built
+     *  once per bake by {@link OccluderGeometryCapturer} and reused across every
+     *  tile / cube face the entity is drawn into (the geometry is view-independent).
+     *  Keyed by entity id; cleared by {@link #beginBake}. An empty array caches a
+     *  capture that produced nothing, so it is not retried within the bake. */
+    private static final Int2ObjectOpenHashMap<float[]> entityGeom = new Int2ObjectOpenHashMap<>();
+    /** Triangles (POSITION xyz) accumulated for the current pass; uploaded + drawn
+     *  once in {@link #endPass} so many casters cost a single draw + state snapshot. */
+    private static final FloatArrayList casterAccum = new FloatArrayList();
     private static int casterScratchVbo = 0;
+    /** Persistent off-heap upload buffer, grown on demand and reused across passes
+     *  (a moving caster flushes every dynamic pass / cube face — a fresh
+     *  memAllocFloat each time would be per-frame native churn). Freed by
+     *  {@link #releaseScratch}. */
+    private static FloatBuffer casterScratch;
+    private static int casterScratchCap;
 
     /**
-     * Accumulate one occluder for the current depth pass. Entities are drawn as
-     * their interpolated bounding box (a blob occluder) through the depth program
-     * — see the class note on why a faithful model render is not reachable on
-     * 1.21.11. Block occluders go through {@link #renderBlocksDepth}; model-block
-     * casters are not produced on this port, so only entities are handled here.
-     * The boxes are batched and flushed in {@link #endPass}.
+     * Accumulate one occluder's REAL model silhouette for the current depth pass.
+     * Entities are captured as their actual model triangles (via {@link
+     * OccluderGeometryCapturer#captureEntityTris}, replacing the old AABB box) and
+     * appended to {@link #casterAccum}, drawn once in {@link #endPass}. The capture
+     * runs once per entity per bake and is reused across passes (it is view-
+     * independent world-space geometry). Block occluders go through {@link
+     * #renderBlocksDepth}; model-block / replay casters are not produced on this
+     * port, so only entities are handled here.
      */
     public static void renderCaster(Object caster, int casterType, float tickDelta)
     {
@@ -270,39 +272,32 @@ public final class ShadowRenderer
         }
 
         Entity e = (Entity) caster;
-        // entity.getBoundingBox() is at the current tick position; shift it by the
-        // render-interpolation delta so the shadow tracks the smoothed pose.
-        double ix = MathHelper.lerp(tickDelta, e.lastRenderX, e.getX()) - e.getX();
-        double iy = MathHelper.lerp(tickDelta, e.lastRenderY, e.getY()) - e.getY();
-        double iz = MathHelper.lerp(tickDelta, e.lastRenderZ, e.getZ()) - e.getZ();
-        Box box = e.getBoundingBox();
-        float m = ENTITY_BOX_INFLATE;
-
-        if (casterBuf == null)
+        float[] tris = entityGeom.get(e.getId());
+        if (tris == null)
         {
-            casterBuf = MemoryUtil.memAllocFloat(CASTER_MAX_BOXES * 36 * 3);
+            tris = OccluderGeometryCapturer.captureEntityTris(e, tickDelta);
+            entityGeom.put(e.getId(), tris);
         }
-        if (casterBuf.remaining() < 36 * 3)
-        {
-            return; // pass is at the box cap
-        }
-        emitBox(casterBuf,
-            (float) (box.minX + ix) - m, (float) (box.minY + iy) - m, (float) (box.minZ + iz) - m,
-            (float) (box.maxX + ix) + m, (float) (box.maxY + iy) + m, (float) (box.maxZ + iz) + m);
-    }
-
-    /** Draw the entity boxes accumulated this pass (if any) with the depth
-     *  program, then reset the buffer. Called by {@link #endPass} before the GL
-     *  state is restored. Mirrors {@link #drawOpaqueBlocks}'s state discipline:
-     *  snapshot every global bit the draw mutates and restore it exactly. */
-    private static void flushCasterBoxes()
-    {
-        if (casterBuf == null || casterBuf.position() == 0 || glBroken || program == 0)
+        if (tris.length == 0)
         {
             return;
         }
-        int verts = casterBuf.position() / 3;
-        casterBuf.flip();
+        casterAccum.addElements(casterAccum.size(), tris);
+    }
+
+    /** Draw the entity silhouette triangles accumulated this pass (if any) with the
+     *  position depth program, then clear the accumulator. Called by {@link
+     *  #endPass} before the GL state is restored. Mirrors {@link #drawOpaqueBlocks}'s
+     *  state discipline: snapshot every global bit the draw mutates and restore it
+     *  exactly. */
+    private static void flushCasters()
+    {
+        if (casterAccum.isEmpty() || glBroken || program == 0)
+        {
+            return;
+        }
+        int floats = casterAccum.size();
+        int verts = floats / 3;
 
         int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         int prevVao = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
@@ -312,20 +307,37 @@ public final class ShadowRenderer
         boolean prevDepthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
         boolean prevCull = GL11.glIsEnabled(GL11.GL_CULL_FACE);
 
+        // Grow-only persistent upload buffer (no per-pass alloc/free).
+        if (casterScratch == null || floats > casterScratchCap)
+        {
+            if (casterScratch != null)
+            {
+                MemoryUtil.memFree(casterScratch);
+            }
+            casterScratchCap = Math.max(floats, 4096);
+            casterScratch = MemoryUtil.memAllocFloat(casterScratchCap);
+        }
+        FloatBuffer fb = casterScratch;
         try
         {
+            fb.clear();
+            fb.put(casterAccum.elements(), 0, floats);
+            fb.flip();
+
             GL11.glEnable(GL11.GL_DEPTH_TEST);
             GL11.glDepthFunc(GL11.GL_LEQUAL);
             GL11.glDepthMask(true);
+            // Cull OFF: the model captures both windings; the depth test keeps the
+            // nearest (light-facing) surface -> a tight, correct silhouette.
             GL11.glDisable(GL11.GL_CULL_FACE);
 
             GL20.glUseProgram(program);
             currentProj.mul(currentView, viewProj);
             try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush())
             {
-                FloatBuffer fb = stack.mallocFloat(16);
-                viewProj.get(fb);
-                GL20.glUniformMatrix4fv(uViewProjLoc, false, fb);
+                FloatBuffer mb = stack.mallocFloat(16);
+                viewProj.get(mb);
+                GL20.glUniformMatrix4fv(uViewProjLoc, false, mb);
             }
 
             if (casterScratchVbo == 0)
@@ -334,7 +346,7 @@ public final class ShadowRenderer
             }
             GL30.glBindVertexArray(vao);
             GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, casterScratchVbo);
-            GL15.glBufferData(GL15.GL_ARRAY_BUFFER, casterBuf, GL15.GL_STREAM_DRAW);
+            GL15.glBufferData(GL15.GL_ARRAY_BUFFER, fb, GL15.GL_STREAM_DRAW);
             GL20.glEnableVertexAttribArray(0);
             GL20.glVertexAttribPointer(0, 3, GL11.GL_FLOAT, false, 12, 0L);
 
@@ -358,7 +370,24 @@ public final class ShadowRenderer
             GL11.glDepthFunc(prevDepthFunc);
             if (prevDepthTest) { GL11.glEnable(GL11.GL_DEPTH_TEST); } else { GL11.glDisable(GL11.GL_DEPTH_TEST); }
             if (prevCull) { GL11.glEnable(GL11.GL_CULL_FACE); } else { GL11.glDisable(GL11.GL_CULL_FACE); }
-            casterBuf.clear();
+            casterAccum.clear();
+        }
+    }
+
+    /** Free the persistent caster scratch buffer + its VBO (called on shaders-off,
+     *  alongside the depth textures). Both lazily re-create on the next bake. */
+    public static void releaseScratch()
+    {
+        if (casterScratch != null)
+        {
+            MemoryUtil.memFree(casterScratch);
+            casterScratch = null;
+            casterScratchCap = 0;
+        }
+        if (casterScratchVbo != 0)
+        {
+            GL15.glDeleteBuffers(casterScratchVbo);
+            casterScratchVbo = 0;
         }
     }
 
@@ -401,7 +430,7 @@ public final class ShadowRenderer
      * Render a light's block occluders into the currently-bound depth FBO, between
      * a begin*()/endPass() bracket. Opaque-shape blocks are drawn as their
      * {@link BlockShadowEntry#shape} AABB triangles; cutout blocks (shape == null)
-     * are drawn from their textured {@link BakedQuad} geometry with alpha discard
+     * are drawn from their real MC-tessellated textured geometry with alpha discard
      * (see {@link #renderBlocksDepthCutout}). Both use the per-light view/proj.
      */
     public static void renderBlocksDepth(long id, List<BlockShadowEntry> blocks)
@@ -604,13 +633,12 @@ public final class ShadowRenderer
 
     // --- Cutout block depth bake (textured, alpha-tested) ---------------------
 
-    private static final Direction[] DIRECTIONS = Direction.values();
-
     /**
-     * Draw a light's cutout blocks from their textured {@link BakedQuad} geometry,
-     * sampling the block atlas and discarding transparent texels so light passes
-     * through (lacy leaf / grate / glass-pane shadows). Per-light VBO cached like
-     * the opaque path. Called from {@link #renderBlocksDepth} within a pass.
+     * Draw a light's cutout blocks from their real MC-tessellated textured geometry
+     * (see {@link OccluderGeometryCapturer#captureCutoutBlockTris}), sampling the
+     * block atlas and discarding transparent texels so light passes through (lacy
+     * leaf / grate / glass-pane shadows). Per-light VBO cached like the opaque path.
+     * Called from {@link #renderBlocksDepth} within a pass.
      */
     private static void renderBlocksDepthCutout(long id, List<BlockShadowEntry> blocks)
     {
@@ -711,11 +739,10 @@ public final class ShadowRenderer
     }
 
     /** Build (or rebuild) a light's cutout VBO (interleaved POSITION(3)+UV(2),
-     *  stride 20) from its cutout entries' BakedModel quads. Returns the vertex
-     *  count (0 if there is no cutout geometry). Quads are emitted with absolute
-     *  world coordinates (model-local position + block origin), matching the
-     *  opaque path; neighbour face-culling is skipped (over-draw is safe for a
-     *  silhouette and avoids needing the world-aware tessellator). */
+     *  stride 20) from its cutout entries, tessellated by MC's real block renderer
+     *  ({@link OccluderGeometryCapturer#captureCutoutBlockTris}) in absolute world
+     *  coordinates with neighbour face-culling + correct atlas UVs. Returns the
+     *  vertex count (0 if there is no cutout geometry). */
     private static int buildCutoutVbo(long id, List<BlockShadowEntry> blocks)
     {
         MinecraftClient mc = MinecraftClient.getInstance();
@@ -745,26 +772,13 @@ public final class ShadowRenderer
                 {
                     continue;
                 }
-                BlockStateModel model = brm.getModel(state);
-                if (model == null)
+                // Real MC tessellation (neighbour-culled, correct atlas UVs) ->
+                // world-space POSITION+UV triangles in the stride-20 layout this
+                // buffer expects. Replaces the old hand-rolled BakedQuad walk.
+                float[] tris = OccluderGeometryCapturer.captureCutoutBlockTris(world, brm, p, state, cutoutRandom);
+                if (tris.length > 0)
                 {
-                    continue;
-                }
-                cutoutRandom.setSeed(state.getRenderingSeed(p));
-                List<BlockModelPart> parts = model.getParts(cutoutRandom);
-                float ox = p.getX(), oy = p.getY(), oz = p.getZ();
-                for (int pi = 0, pn = parts.size(); pi < pn; pi++)
-                {
-                    BlockModelPart part = parts.get(pi);
-                    if (part == null)
-                    {
-                        continue;
-                    }
-                    emitCutoutQuads(data, part.getQuads(null), ox, oy, oz);
-                    for (Direction d : DIRECTIONS)
-                    {
-                        emitCutoutQuads(data, part.getQuads(d), ox, oy, oz);
-                    }
+                    data.addElements(data.size(), tris);
                 }
             }
             catch (Throwable t)
@@ -808,41 +822,6 @@ public final class ShadowRenderer
         {
             MemoryUtil.memFree(fb);
         }
-    }
-
-    /** Append a quad list as triangles (POSITION+UV) to the cutout vertex data. */
-    private static void emitCutoutQuads(FloatArrayList out, List<BakedQuad> quads, float ox, float oy, float oz)
-    {
-        if (quads == null)
-        {
-            return;
-        }
-        for (int i = 0, n = quads.size(); i < n; i++)
-        {
-            BakedQuad q = quads.get(i);
-            if (q == null)
-            {
-                continue;
-            }
-            // quad corners 0,1,2,3 -> two triangles (0,1,2) + (0,2,3)
-            appendCutoutVert(out, q, 0, ox, oy, oz);
-            appendCutoutVert(out, q, 1, ox, oy, oz);
-            appendCutoutVert(out, q, 2, ox, oy, oz);
-            appendCutoutVert(out, q, 0, ox, oy, oz);
-            appendCutoutVert(out, q, 2, ox, oy, oz);
-            appendCutoutVert(out, q, 3, ox, oy, oz);
-        }
-    }
-
-    private static void appendCutoutVert(FloatArrayList out, BakedQuad q, int i, float ox, float oy, float oz)
-    {
-        Vector3fc pos = q.getPosition(i);
-        long uv = q.getTexcoords(i);
-        out.add(pos.x() + ox);
-        out.add(pos.y() + oy);
-        out.add(pos.z() + oz);
-        out.add(Vector2f.getX(uv));
-        out.add(Vector2f.getY(uv));
     }
 
     /** Raw GL id of the block atlas texture, or 0 if it is not allocated yet. */
@@ -1033,9 +1012,9 @@ public final class ShadowRenderer
             return;
         }
 
-        // Draw the entity boxes accumulated in this pass before restoring state
-        // (they share the pass's currentView/currentProj, still set here).
-        flushCasterBoxes();
+        // Draw the entity silhouettes accumulated in this pass before restoring
+        // state (they share the pass's currentView/currentProj, still set here).
+        flushCasters();
 
         GL11.glDepthMask(savedDepthMask);
 

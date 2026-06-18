@@ -850,6 +850,7 @@ public final class ShadowBaker
         liveIds.clear();
         BlockShadowCache.retainOnly(liveIds);
         ShadowRenderer.retainBlockVbos(liveIds);
+        ShadowRenderer.releaseScratch();
         SpotlightDepthAtlas.delete();
         PointShadowArray.delete();
     }

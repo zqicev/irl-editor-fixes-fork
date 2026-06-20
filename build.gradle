@@ -53,13 +53,24 @@ dependencies {
 
 	// imgui-java: binding + LWJGL3 backend (client only). LWJGL itself is provided
 	// by Minecraft, so the backend's transitive LWJGL is excluded to avoid a second
-	// (conflicting) copy on the classpath.
+	// (conflicting) copy on the classpath. The same coords are also `include`d so
+	// Loom bundles them in the production jar via JiJ — without this the packaged
+	// jar resolves at runtime with NoClassDefFoundError: imgui/ImColor, because
+	// these aren't Fabric mods and the user can't drop them in mods/ themselves.
 	clientImplementation "io.github.spair:imgui-java-binding:${imguiVersion}"
 	clientImplementation("io.github.spair:imgui-java-lwjgl3:${imguiVersion}") {
 		exclude group: 'org.lwjgl'
 	}
-	// JNI natives are runtime-only. Windows for dev; add -linux / -macos for release.
+	include "io.github.spair:imgui-java-binding:${imguiVersion}"
+	include("io.github.spair:imgui-java-lwjgl3:${imguiVersion}") {
+		exclude group: 'org.lwjgl'
+	}
+	// JNI natives are runtime-only; bundle all three OS variants so one jar runs
+	// on any platform (Windows is also kept in clientRuntimeOnly for runClient).
 	clientRuntimeOnly "io.github.spair:imgui-java-natives-windows:${imguiVersion}"
+	include "io.github.spair:imgui-java-natives-windows:${imguiVersion}"
+	include "io.github.spair:imgui-java-natives-linux:${imguiVersion}"
+	include "io.github.spair:imgui-java-natives-macos:${imguiVersion}"
 
 	// --- Shared BBS-free engine: light SSBO + .irlights patcher (irl-core) ---
 	// Plain Java lib via Gradle composite build (settings.gradle includeBuild),

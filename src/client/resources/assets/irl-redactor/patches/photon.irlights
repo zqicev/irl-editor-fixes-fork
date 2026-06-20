@@ -767,6 +767,10 @@ vec3 irlite_volumetric(vec3 startWorld, vec3 endWorld, vec3 worldDir, float dith
                 if (spotAtten <= 0.0) continue;
                 atten = falloff * spotAtten;
                 phase = phaseSpot;
+                #ifdef IRLITE_COMPILE_COOKIE
+                    atten *= irlite_cookie(startWorld + pos, light);   // gobo shapes the beam
+                    if (atten <= 0.0) continue;
+                #endif
             }
             else
             {

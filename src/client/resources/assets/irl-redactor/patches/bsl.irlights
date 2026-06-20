@@ -64,6 +64,7 @@ struct IrliteLight
     vec4 dirType;         // xyz spot direction, w type (0 point, 1 spot)
     vec4 cone;            // x cos(outer/2), y cos(inner/2), z lightMask (0 all/1 entities/2 blocks), w bulbSize (0 = use global)
     vec4 vlParams;        // x anisotropy(HG g), y vlDensity, z beamStrength, w shadowTile/layer (-1 none)
+    vec4 cookie;          // x gobo layer (-1 none), y rotation(rad), z scale, w flags (bit0 invert)
 };
 
 layout(std430, binding = 7) buffer IrliteLights

@@ -41,6 +41,17 @@ repositories {
 	mavenCentral()
 }
 
+// Minecraft 1.20.1 ships LWJGL 3.3.1; a transitive dep bumps it to 3.3.2, which
+// Sodium refuses to start against. Pin every LWJGL module back to 3.3.1.
+// (1.20.4 shipped LWJGL 3.3.3 and needed no pin.)
+configurations.all {
+	resolutionStrategy.eachDependency { details ->
+		if (details.requested.group == "org.lwjgl") {
+			details.useVersion "3.3.1"
+		}
+	}
+}
+
 // Dear ImGui (imgui-java by SpaiR). The editor GUI is rendered with ImGui, fully
 // decoupled from Minecraft's own GUI system and from BBS.
 def imguiVersion = '1.89.0'
@@ -80,9 +91,9 @@ dependencies {
 
 	// --- IRLite lighting base (BBS-free port) ---
 	// Iris is referenced at compile time by the shadow-sampler mixins; Sodium is
-	// runtime-only. 1.20.4 ships LWJGL 3.3.3, so no LWJGL pin is needed.
-	modImplementation "maven.modrinth:iris:1.7.2+1.20.4"
-	modRuntimeOnly "maven.modrinth:sodium:mc1.20.4-0.5.8"
+	// runtime-only. 1.20.1 ships LWJGL 3.3.1; the pin above keeps it there.
+	modImplementation "maven.modrinth:iris:1.7.2+1.20.1"
+	modRuntimeOnly "maven.modrinth:sodium:mc1.20.1-0.5.11"
 
 	// Iris runtime dependencies (not auto-pulled from the Modrinth artifact).
 	modRuntimeOnly "org.anarres:jcpp:1.4.14"
@@ -92,7 +103,7 @@ dependencies {
 	// NOT a dependency of the mod itself — the Replay Mod integration is gated by
 	// FabricLoader.isModLoaded("replaymod") + reflection. This only puts Replay Mod
 	// on the dev classpath so the editor can be tested inside a replay.
-	modRuntimeOnly "maven.modrinth:replaymod:1.20.4-2.6.23"
+	modRuntimeOnly "maven.modrinth:replaymod:1.20.1-2.6.19"
 }
 
 processResources {

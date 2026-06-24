@@ -939,7 +939,7 @@ before "        // Specular highlight"
         vec3 irlite_specular;
         vec3 irlite_outline;
         irlite_lightSurface(
-            position_world,
+            position_world - cameraPosition,   // camera-relative: SSBO light pos is now camera-relative (precise far from origin)
             normal,
             flat_normal,
             -direction_world,
@@ -979,7 +979,7 @@ after "    fog_scattering +=\n        get_lpv_fog_scattering(world_start_pos, wo
     // IRLite VL: add inscatter to fog_scattering.
     vec3 irlite_worldDir = normalize(world_end_pos - world_start_pos);
     fog_scattering +=
-        irlite_volumetric(world_start_pos, world_end_pos, irlite_worldDir, dither);
+        irlite_volumetric(world_start_pos - cameraPosition, world_end_pos - cameraPosition, irlite_worldDir, dither);
 #endif
 >>>
 

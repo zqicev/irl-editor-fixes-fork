@@ -81,6 +81,6 @@ public class GameRendererLightMixin
         }
         ShadowBaker.bake(world, cameraPos, cameraForward, tickDelta);
 
-        LightRegistry.flush();
+        LightRegistry.flush(cameraPos.x, cameraPos.y, cameraPos.z); // camera-relative SSBO: lights work far from world origin
     }
 }

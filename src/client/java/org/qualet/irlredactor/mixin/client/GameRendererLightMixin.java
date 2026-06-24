@@ -81,6 +81,10 @@ public class GameRendererLightMixin
         }
         ShadowBaker.bake(world, cameraPos, cameraForward, tickDelta);
 
-        LightRegistry.flush();
+        // Upload light positions RELATIVE to the camera (eye): the GLSL patches now
+        // compare against the camera-relative fragment position, so large absolute
+        // world coordinates never enter the precision-sensitive light math (lights
+        // were going dark far from world origin). See LightRegistry.flush(double...).
+        LightRegistry.flush(cameraPos.x, cameraPos.y, cameraPos.z);
     }
 }

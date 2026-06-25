@@ -24,6 +24,14 @@
 > 👉 **See [FIXES.md](FIXES.md)** — what changed **and how to build** (this fork needs the
 > bundled `irl-core-camera-relative.patch` applied to `irl-core`; build steps are there too).
 
+> ### 🎬 This branch also has the Flashback bridge
+> `port/1.21.1-flashback` additionally ships the **Flashback integration API**
+> (`org.qualet.irlredactor.api.IrlFlashbackBridge` + a persistent per-light `uid`), used by the
+> [IRL Lights x Flashback addon](https://github.com/zqicev/flashback-addon-irl). Build
+> `irl-redactor` from **this** branch (not the plain `port/1.21.1`) if you want the addon to work —
+> the other branches do not ship the bridge. The Axiom and far-from-origin light fixes are included
+> here as well, and the build steps are the same (see [FIXES.md](FIXES.md)).
+
 ## What is IRL-editor?
 
 IRL-editor is a client-side Fabric mod that brings the [IRLights](https://github.com/quaIett/bbs-irlights-addon)

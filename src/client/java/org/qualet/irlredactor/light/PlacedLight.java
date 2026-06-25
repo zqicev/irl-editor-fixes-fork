@@ -1,5 +1,7 @@
 package org.qualet.irlredactor.light;
 
+import java.util.UUID;
+
 /**
  * A single light source placed in the world, in pure world coordinates. This is
  * the BBS-free neutral data model that replaces IRLite's BBS PointLightForm /
@@ -19,8 +21,16 @@ public class PlacedLight
 
     private static long NEXT_ID = 1L;
 
-    /** Stable per-light id (keys the shadow tile / dirty / block caches). */
+    /** Stable per-light id (keys the shadow tile / dirty / block caches). Runtime
+     *  only — NOT persisted (a fresh id is minted on every load). */
     public final long id;
+
+    /** Persistent per-light identity, stable across save/load (unlike {@link #id}).
+     *  External integrations (e.g. the Flashback keyframe bridge,
+     *  {@code org.qualet.irlredactor.api.IrlFlashbackBridge}) reference a light by
+     *  this. Persisted by {@link LightStore}; a fresh value is minted for a new or
+     *  duplicated light. */
+    public String uid = UUID.randomUUID().toString();
 
     public Type type = Type.POINT;
 

@@ -1,7 +1,19 @@
-# Fork fixes (IRL-editor, 1.21.1)
+# Fork fixes — IRL-editor (all version branches)
 
-This fork of [`irl-editor`](https://github.com/quaIett/irl-editor) (`port/1.21.1`) adds two
-fixes. Each is a separate commit so they can be reviewed/cherry-picked independently.
+A fork of [`irl-editor`](https://github.com/quaIett/irl-editor) that adds two fixes on **every
+version branch** — branches mirror upstream:
+
+| Branch | Minecraft |
+|---|---|
+| `main` | 1.20.4 |
+| `port/1.20.1` | 1.20.1 |
+| `port/1.21.1` | 1.21.1 |
+| `port/1.21.4` | 1.21.4 |
+| `port/1.21.11` | 1.21.11 |
+
+The fixes are **version-independent and identical on every branch**; each is a separate commit so
+they can be reviewed/cherry-picked independently. **Check out the branch that matches your
+Minecraft version** (see [Building](#building) below).
 
 ## 1. Axiom compatibility — ImGui backend init survives a conflicting imgui-java
 
@@ -75,12 +87,18 @@ Steps:
 git clone https://github.com/zqicev/irl-editor-fixes-fork.git
 git clone https://github.com/quaIett/irl-core.git
 
-# 2. apply the camera-relative patch to irl-core
+# 2. check out the branch for YOUR Minecraft version
+#    main = 1.20.4 · port/1.20.1 · port/1.21.1 · port/1.21.4 · port/1.21.11
+cd irl-editor-fixes-fork
+git checkout port/1.21.4      # ← change to your version (default branch = main = 1.20.4)
+cd ..
+
+# 3. apply the camera-relative patch to irl-core (the SAME patch for every version)
 cd irl-core
 git apply ../irl-editor-fixes-fork/irl-core-camera-relative.patch
 #   (if it doesn't apply cleanly: `git apply --3way …`, or `patch -p1 < …`)
 
-# 3. build the mod
+# 4. build the mod
 cd ../irl-editor-fixes-fork
 ./gradlew build      # Windows: gradlew.bat build
 ```

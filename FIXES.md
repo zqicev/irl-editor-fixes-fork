@@ -54,7 +54,42 @@ git apply ../irl-editor-fixes-fork/irl-core-camera-relative.patch
 The patch keeps the old `flush()` (= absolute) for ABI compatibility and only adds the
 camera-relative `flush(double, double, double)` overload that this fork calls.
 
-## Build / verify
-- Apply the `irl-core` patch (above), then `./gradlew build` in this repo.
+## Building
+
+This mod is built as a Gradle **composite build**: its `settings.gradle` has
+`includeBuild("../irl-core")`, so `irl-core` must sit **next to this repo as a sibling
+directory named exactly `irl-core`**, and it must have the camera-relative patch applied
+(see above) — otherwise the build fails to compile (`LightRegistry.flush(double,double,double)`
+won't exist). Required layout:
+
+```
+<workspace>/
+├── irl-editor-fixes-fork/   ← this repo (the folder name doesn't matter)
+└── irl-core/                ← quaIett/irl-core, MUST be named "irl-core", patch applied
+```
+
+Steps:
+
+```bash
+# 1. clone both side by side
+git clone https://github.com/zqicev/irl-editor-fixes-fork.git
+git clone https://github.com/quaIett/irl-core.git
+
+# 2. apply the camera-relative patch to irl-core
+cd irl-core
+git apply ../irl-editor-fixes-fork/irl-core-camera-relative.patch
+#   (if it doesn't apply cleanly: `git apply --3way …`, or `patch -p1 < …`)
+
+# 3. build the mod
+cd ../irl-editor-fixes-fork
+./gradlew build      # Windows: gradlew.bat build
+```
+
+- JDK 21 (Gradle/Loom provisions the right toolchain per Minecraft version automatically).
+- `irl-core` is version-independent (one jar for every MC version), so the **same** patched
+  `irl-core` builds **every** branch of this fork — only check out the branch for your MC version.
+- Output: `build/libs/irl-redactor-1.0-obt.jar` (bundles `irl-core` via Jar-in-Jar).
+
+## Verify
 - In-game: enable a patched shaderpack, teleport to X ≈ 100 000, place a point light → it lights.
-- Near origin: unchanged.
+- Near origin (X ≈ 0): unchanged.

@@ -115,6 +115,7 @@ public final class LightStore
      *  static counter aren't persisted (a fresh id is minted on load). */
     private static final class Dto
     {
+        String uid;
         String type;
         String name;
         double x, y, z;
@@ -130,6 +131,7 @@ public final class LightStore
         static Dto from(PlacedLight l)
         {
             Dto d = new Dto();
+            d.uid = l.uid;
             d.type = l.type.name();
             d.name = l.name;
             d.x = l.x; d.y = l.y; d.z = l.z;
@@ -148,6 +150,11 @@ public final class LightStore
         PlacedLight to()
         {
             PlacedLight l = new PlacedLight(); // fresh stable id (advances counter -> no collisions)
+            // Carry the persistent uid; mint a fresh one only for legacy files (pre-uid).
+            if (uid != null && !uid.isEmpty())
+            {
+                l.uid = uid;
+            }
             l.type = "SPOT".equals(type) ? PlacedLight.Type.SPOT : PlacedLight.Type.POINT;
             l.name = name == null ? "Источник" : name;
             l.x = x; l.y = y; l.z = z;

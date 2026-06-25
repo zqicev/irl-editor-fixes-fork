@@ -15,6 +15,15 @@
 
 ---
 
+> ### 🔧 This is a fixes-fork
+> A fork of [`quaIett/irl-editor`](https://github.com/quaIett/irl-editor) with two fixes:
+> **Axiom compatibility** and a fix for **dynamic lights going dark far from world origin**
+> (a camera-relative light pipeline). Branches mirror upstream — `main` = 1.20.4,
+> `port/1.21.1`, `port/1.21.4`, `port/1.21.11`, `port/1.20.1`.
+>
+> 👉 **See [FIXES.md](FIXES.md)** — what changed **and how to build** (this fork needs the
+> bundled `irl-core-camera-relative.patch` applied to `irl-core`; build steps are there too).
+
 ## What is IRL-editor?
 
 IRL-editor is a client-side Fabric mod that brings the [IRLights](https://github.com/quaIett/bbs-irlights-addon)

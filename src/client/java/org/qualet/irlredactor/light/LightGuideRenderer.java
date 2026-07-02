@@ -1,9 +1,9 @@
 package org.qualet.irlredactor.light;
 
-import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
-import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
+import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.render.Camera;
-import net.minecraft.client.render.RenderLayers;
+import net.minecraft.client.render.RenderLayer;
 import net.minecraft.client.render.VertexConsumer;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.util.math.Vec3d;
@@ -79,7 +79,7 @@ public final class LightGuideRenderer
         }
 
         Vec3d c = cam.getCameraPos();
-        MatrixStack ms = ctx.matrices();
+        MatrixStack ms = ctx.matrixStack();
         if (ms == null)
         {
             return;
@@ -88,7 +88,7 @@ public final class LightGuideRenderer
 
         // Vanilla line layer (POSITION_COLOR_NORMAL); the world renderer owns the
         // flush, so we only emit segments here.
-        VertexConsumer buf = ctx.consumers().getBuffer(RenderLayers.lines());
+        VertexConsumer buf = ctx.consumers().getBuffer(RenderLayer.getLines());
 
         for (PlacedLight l : LightScene.all())
         {
@@ -186,11 +186,10 @@ public final class LightGuideRenderer
         {
             nx /= nl; ny /= nl; nz /= nl;
         }
-        // The lines layer uses POSITION_COLOR_NORMAL_LINE_WIDTH — the per-vertex
-        // LineWidth element is mandatory (omitting it throws "Missing elements in
-        // vertex: LineWidth"), so it must be written on every vertex.
-        buf.vertex(e.getPositionMatrix(), x1, y1, z1).color(r, g, b, 1f).normal(e, nx, ny, nz).lineWidth(LINE_WIDTH);
-        buf.vertex(e.getPositionMatrix(), x2, y2, z2).color(r, g, b, 1f).normal(e, nx, ny, nz).lineWidth(LINE_WIDTH);
+        // 1.21.8 lines layer is POSITION_COLOR_NORMAL (the per-vertex LineWidth
+        // element only arrives in 1.21.9+), so no lineWidth() is written here.
+        buf.vertex(e.getPositionMatrix(), x1, y1, z1).color(r, g, b, 1f).normal(e, nx, ny, nz);
+        buf.vertex(e.getPositionMatrix(), x2, y2, z2).color(r, g, b, 1f).normal(e, nx, ny, nz);
     }
 
     /** Clamp to [0,1] with a floor so a very dark light still has a visible guide. */

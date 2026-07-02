@@ -1,7 +1,6 @@
 package org.qualet.irlredactor.mixin.client.iris;
 
 import net.irisshaders.iris.gl.program.ProgramSamplers;
-import net.irisshaders.iris.gl.texture.TextureType;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -24,14 +23,11 @@ public class ProgramSamplersBuilderMixin
     private void irlite$bindShadowSamplers(CallbackInfoReturnable<ProgramSamplers> cir)
     {
         ProgramSamplers.Builder self = (ProgramSamplers.Builder) (Object) this;
-        // 1.21.11 / Iris 1.10.7: the old 2-arg addDynamicSampler(IntSupplier, String)
-        // is gone. Register with an explicit TextureType (2D — Iris has no
-        // CUBE_MAP_ARRAY type, so the point cube-array is rebound to its real GL
-        // target by SamplerBindingCubeArrayMixin) and a null GlSampler supplier.
-        self.addDynamicSampler(TextureType.TEXTURE_2D, SpotlightDepthAtlas::getGlTextureId, () -> null, "irl_spotShadowAtlas");
-        self.addDynamicSampler(TextureType.TEXTURE_2D, PointShadowArray::getGlTextureId, () -> null, "irl_pointShadowArray");
-        // Gobo/cookie mask array — like the point cube array, registered as 2D and
-        // rebound to its real GL_TEXTURE_2D_ARRAY target by SamplerBindingCubeArrayMixin.
-        self.addDynamicSampler(TextureType.TEXTURE_2D, CookieArray::getGlTextureId, () -> null, "irl_cookieArray");
+        // Iris 1.9.6 (1.21.8) keeps the 2-arg addDynamicSampler(IntSupplier, String);
+        // the 4-arg TextureType form only arrives in Iris 1.10.x (1.21.11).
+        self.addDynamicSampler(SpotlightDepthAtlas::getGlTextureId, "irl_spotShadowAtlas");
+        self.addDynamicSampler(PointShadowArray::getGlTextureId, "irl_pointShadowArray");
+        // Gobo/cookie mask array — rebound to GL_TEXTURE_2D_ARRAY by SamplerBindingCubeArrayMixin.
+        self.addDynamicSampler(CookieArray::getGlTextureId, "irl_cookieArray");
     }
 }

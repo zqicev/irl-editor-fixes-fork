@@ -38,10 +38,9 @@ public class IRLRedactorClient implements ClientModInitializer
 {
     private static KeyBinding openEditor;
 
-    /** Keybind category. 1.21.11 replaced the plain String category with a
-     *  registered {@link KeyBinding.Category} keyed by an Identifier. */
-    private static final KeyBinding.Category CATEGORY =
-        KeyBinding.Category.create(Identifier.of("irl-redactor", "main"));
+    /** Keybind category. 1.21.8 uses a plain String category; the registered
+     *  {@code KeyBinding.Category} keyed by an Identifier only arrives in 1.21.9+. */
+    private static final String CATEGORY = "category.irl-redactor";
 
     /** Key of the world currently joined (folder name SP / address MP), or null. */
     private static String currentWorldKey;

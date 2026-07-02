@@ -75,8 +75,9 @@ public class GameRendererLightMixin
         // rendering writes into our depth FBO).
         if (world != null && camera != null)
         {
-            // 1.21.11: EntityRenderManager.configure(Camera, Entity) — world arg dropped.
-            mc.getEntityRenderDispatcher().configure(camera, mc.getCameraEntity());
+            // 1.21.8: EntityRenderDispatcher.configure(World, Camera, Entity) — the
+            // 2-arg (Camera, Entity) form only arrives in 1.21.9+.
+            mc.getEntityRenderDispatcher().configure(world, camera, mc.getCameraEntity());
         }
         ShadowBaker.bake(world, cameraPos, cameraForward, tickDelta);
 

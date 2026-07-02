@@ -3,7 +3,7 @@ package org.qualet.irlredactor.light.shadow;
 import net.minecraft.block.BlockRenderType;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.render.BlockRenderLayer;
-import net.minecraft.client.render.BlockRenderLayers;
+import net.minecraft.client.render.RenderLayers;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.shape.VoxelShape;
@@ -109,7 +109,7 @@ public final class BlockShadowCollector
                     BlockRenderLayer layer;
                     try
                     {
-                        layer = BlockRenderLayers.getBlockLayer(state);
+                        layer = RenderLayers.getBlockLayer(state);
                     }
                     catch (Throwable t)
                     {

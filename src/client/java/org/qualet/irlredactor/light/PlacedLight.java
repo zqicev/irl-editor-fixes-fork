@@ -31,6 +31,13 @@ public class PlacedLight
      *  across a save/load cycle. */
     public final transient long id;
 
+    /** Persistent per-light identity, stable across save/load (unlike {@link #id}).
+     *  External integrations (the Flashback keyframe bridge,
+     *  {@code org.qualet.irlredactor.api.IrlFlashbackBridge}) reference a light by this.
+     *  Non-transient, so Gson persists it in the on-disk schema; a fresh value is
+     *  minted for a new or legacy (pre-uid) light. */
+    public String uid = java.util.UUID.randomUUID().toString();
+
     public Type type = Type.POINT;
 
     /** Editor-facing display name (used by the source list). Engine ignores it. */
